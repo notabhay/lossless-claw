@@ -838,7 +838,6 @@ describe("lcm command", () => {
       },
       resolveAgentDir: () => fixture.tempDir,
       resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1136,7 +1135,6 @@ describe("lcm command", () => {
       },
       resolveAgentDir: () => fixture.tempDir,
       resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1251,7 +1249,6 @@ describe("lcm command", () => {
       readLatestAssistantReply: () => undefined,
       resolveAgentDir: () => fixture.tempDir,
       resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     } as unknown as LcmDependencies;
@@ -3290,7 +3287,6 @@ describe("lcm command", () => {
       readLatestAssistantReply: vi.fn(() => undefined) as LcmDependencies["readLatestAssistantReply"],
       resolveAgentDir: vi.fn(() => tmpdir()) as LcmDependencies["resolveAgentDir"],
       resolveSessionIdFromSessionKey: vi.fn(async () => undefined) as LcmDependencies["resolveSessionIdFromSessionKey"],
-      resolveSessionTranscriptFile: vi.fn(async () => undefined) as LcmDependencies["resolveSessionTranscriptFile"],
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
