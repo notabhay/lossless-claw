@@ -567,7 +567,7 @@ describe("lcm command", () => {
       label: "statusold",
       includeSummary: true,
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
 
     const active = await fixture.conversationStore.createConversation({
       sessionId: "status-rollover-new",
@@ -1788,7 +1788,7 @@ describe("lcm command", () => {
       label: "detect_old",
       includeSummary: true,
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "rollover-detect-new",
       sessionKey,
@@ -1824,7 +1824,7 @@ describe("lcm command", () => {
       includeLargeFile: true,
       includeFocusBrief: true,
     });
-    await fixture.conversationStore.archiveConversation(firstArchived.conversationId);
+    await fixture.conversationStore.archiveConversation(firstArchived.conversationId, "rollover-fallback");
 
     const secondArchived = await fixture.conversationStore.createConversation({
       sessionId: "rollover-apply-old-2",
@@ -1835,7 +1835,7 @@ describe("lcm command", () => {
       label: "oldtwo",
       includeSummary: true,
     });
-    await fixture.conversationStore.archiveConversation(secondArchived.conversationId);
+    await fixture.conversationStore.archiveConversation(secondArchived.conversationId, "rollover-fallback");
 
     const active = await fixture.conversationStore.createConversation({
       sessionId: "rollover-apply-new",
@@ -2071,7 +2071,7 @@ describe("lcm command", () => {
       label: "oldfk",
       includeSummary: true,
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
 
     const active = await fixture.conversationStore.createConversation({
       sessionId: "rollover-preexisting-fk-new",
@@ -2139,7 +2139,7 @@ describe("lcm command", () => {
       label: "collision_old",
       transcriptEntryId: "duplicate-entry-id",
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "rollover-collision-new",
       sessionKey,
@@ -2185,7 +2185,7 @@ describe("lcm command", () => {
       includeSummary: true,
       includeFocusBrief: true,
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "cron-rollover-new",
       sessionKey,
@@ -2269,7 +2269,7 @@ describe("lcm command", () => {
         tokenCount: 4,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId, "rollover-fallback");
 
     const cronConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-cron",
@@ -2319,7 +2319,7 @@ describe("lcm command", () => {
       },
     ]);
 
-    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId, "rollover-fallback");
 
     const liveNullSubagent = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-live-null-subagent",
@@ -2405,7 +2405,7 @@ describe("lcm command", () => {
         tokenCount: 5,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId, "rollover-fallback");
 
     const cronConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-apply-cron",
@@ -2440,7 +2440,7 @@ describe("lcm command", () => {
         tokenCount: 4,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId, "rollover-fallback");
 
     const liveNullSubagent = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-apply-live-null",
@@ -2520,7 +2520,7 @@ describe("lcm command", () => {
         tokenCount: 5,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId, "rollover-fallback");
 
     const cronConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-single-cron",
@@ -3543,7 +3543,7 @@ describe("lcm command", () => {
       sessionId: "shared-key-old",
       sessionKey: "agent:main:main",
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "shared-key-new",
       sessionKey: "agent:main:main",
@@ -3568,7 +3568,7 @@ describe("lcm command", () => {
       sessionId: "shared-session-id",
       sessionKey: "agent:main:archived",
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "shared-session-id",
       sessionKey: "agent:main:active",
