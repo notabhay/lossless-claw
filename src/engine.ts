@@ -120,6 +120,31 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+
+function collectInlineToolResultText(value: unknown, output: string[] = []): string[] {
+  if (typeof value === "string") {
+    output.push(value);
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectInlineToolResultText(item, output);
+    }
+    return output;
+  }
+  if (!value || typeof value !== "object") {
+    return output;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.type === "text" && typeof record.text === "string") {
+    output.push(record.text);
+    return output;
+  }
+  collectInlineToolResultText(record.content, output);
+  collectInlineToolResultText(record.output, output);
+  collectInlineToolResultText(record.result, output);
+  return output;
+}
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -2643,6 +2668,20 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     let stored = toStoredMessage(message);
+    if (
+      this.config.toolResultPayloadMode === "inline" &&
+      (message.role === "tool" || message.role === "toolResult") &&
+      stored.content.trim().length === 0
+    ) {
+      const content = collectInlineToolResultText(
+        (message as unknown as Record<string, unknown>).content,
+      )
+        .filter((text) => text.trim().length > 0)
+        .join("\n");
+      if (content) {
+        stored = { ...stored, content, tokenCount: estimateTokens(content) };
+      }
+    }
     if (isOpenClawRuntimeContextLeak(stored)) {
       return { ingested: false };
     }
@@ -2749,7 +2788,7 @@ export class LcmContextEngine implements ContextEngine {
           } as AgentMessage;
         }
       }
-    } else if (stored.role === "tool") {
+    } else if (stored.role === "tool" && this.config.toolResultPayloadMode !== "inline") {
       const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
         conversationId,
         message: messageForParts,
@@ -2762,11 +2801,16 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const rawPayloadIntercepted = await this.largeFileInterceptor.interceptLargeRawPayload({
-      conversationId,
-      message: messageForParts,
-      stored,
-    });
+    const retainRawPayloadInline =
+      (stored.role === "user" && this.config.rawUserPayloadMode === "inline") ||
+      (stored.role === "tool" && this.config.toolResultPayloadMode === "inline");
+    const rawPayloadIntercepted = retainRawPayloadInline
+      ? null
+      : await this.largeFileInterceptor.interceptLargeRawPayload({
+          conversationId,
+          message: messageForParts,
+          stored,
+        });
     if (rawPayloadIntercepted) {
       messageForParts = rawPayloadIntercepted.rewrittenMessage;
       stored = rawPayloadIntercepted.stored;
@@ -3498,6 +3542,13 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
+      liveMessages = await this.largeFileInterceptor.externalizeRuntimeExternalFiles({
+        conversationId: conversation.conversationId,
+        messages: liveMessages,
+        runtimeContext: params.runtimeContext,
+        logWarn: (message) => this.deps.log.warn(message),
+      });
+
       // Intercept large tool results in live messages so even degraded
       // fallback paths send stubbed content to the model. The
       // afterTurn ingest path also runs `interceptLargeToolResults` on
@@ -3875,22 +3926,33 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const overflowExternalization = await this.largeFileInterceptor.externalizeInlinePayloadsForOverflow({
+        conversationId: conversation.conversationId,
+        messages: volatileLiveInputAppend.messages,
+        tokenBudget,
+      });
+      if (overflowExternalization.externalizedCount > 0) {
+        this.deps.log.warn(
+          `[lcm] assemble: externalized inline payload overflow conversation=${conversation.conversationId} ${sessionLabel} externalized=${overflowExternalization.externalizedCount} estimatedTokens=${overflowExternalization.estimatedTokens} tokenBudget=${tokenBudget}`,
+        );
+      }
+
       // Final budget clamp by serialized (model-boundary) estimate. Internal
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
       let serializedClamp = clampMessagesToSerializedBudget({
-        messages: volatileLiveInputAppend.messages,
+        messages: overflowExternalization.messages,
         tokenBudget,
       });
       if (serializedClamp.clamped && budgetedPromptRecallCue) {
         // The recall cue is optional enrichment: drop it before evicting any
         // real context, mirroring the internal cue-vs-eviction priority.
         const cueMessage = budgetedPromptRecallCue.message;
-        const withoutCue = volatileLiveInputAppend.messages.filter(
+        const withoutCue = overflowExternalization.messages.filter(
           (message) => message !== cueMessage,
         );
-        if (withoutCue.length < volatileLiveInputAppend.messages.length) {
+        if (withoutCue.length < overflowExternalization.messages.length) {
           serializedClamp = clampMessagesToSerializedBudget({
             messages: withoutCue,
             tokenBudget,

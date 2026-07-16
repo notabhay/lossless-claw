@@ -129,6 +129,24 @@ Good default:
 - `false`
 - enable it only after migration and live validation
 
+### `rawUserPayloadMode`
+
+Controls oversized authored user payloads.
+
+- `externalize-large` uses upstream eager externalization.
+- `inline` preserves exact authored content until the assembled prompt genuinely exceeds its budget, then writes one stable recoverable reference.
+
+Good default: `externalize-large`. Brodie uses `inline` because its typed inbound envelope is source evidence.
+
+### `toolResultPayloadMode`
+
+Controls oversized tool results.
+
+- `externalize-large` uses upstream eager externalization.
+- `inline` preserves the exact result until the assembled prompt genuinely exceeds its budget, then writes one stable recoverable reference without breaking tool-call pairing.
+
+Good default: `externalize-large`. Use `inline` only when exact inline tool history is required.
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.

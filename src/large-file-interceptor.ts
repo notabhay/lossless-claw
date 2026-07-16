@@ -6,15 +6,17 @@
  *
  * Extracted from engine.ts (Phase 2 of the engine decomposition).
  */
-import { mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, realpath, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { LcmConfig } from "./db/config.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import { estimateAgentMessageTokens } from "./token-accounting.js";
 import {
   extensionFromNameOrMime,
+  formatExternalFileReference,
   formatFileReference,
   formatRawPayloadReference,
   formatToolOutputReference,
@@ -36,6 +38,28 @@ import { asRecord, safeBoolean, safeString } from "./value-utils.js";
 export type LargeFileTextSummarizerResolver = (params?: {
   conversationId?: number;
 }) => Promise<((prompt: string) => Promise<string | null>) | undefined>;
+
+type RuntimeMediaUnderstanding = {
+  kind?: unknown;
+  text?: unknown;
+  provider?: unknown;
+  model?: unknown;
+  trust?: unknown;
+};
+
+type RuntimeExternalFile = {
+  marker?: unknown;
+  idempotencyKey?: unknown;
+  mediaRef?: unknown;
+  managedLocalPath?: unknown;
+  fileName?: unknown;
+  mimeType?: unknown;
+  kind?: unknown;
+  sourceMessageId?: unknown;
+  sourceIndex?: unknown;
+  contentHash?: unknown;
+  understanding?: unknown;
+};
 
 export class LargeFileInterceptor {
   constructor(
@@ -220,6 +244,358 @@ export class LargeFileInterceptor {
   /** Resolve the configured externalized-payload directory for one conversation. */
   private largeFilesDirForConversation(conversationId: number): string {
     return join(this.config.largeFilesDir, String(conversationId));
+  }
+
+  private readRuntimeExternalFiles(runtimeContext?: Record<string, unknown>): RuntimeExternalFile[] {
+    return Array.isArray(runtimeContext?.externalFiles)
+      ? runtimeContext.externalFiles.filter(
+          (entry): entry is RuntimeExternalFile => Boolean(entry && typeof entry === "object"),
+        )
+      : [];
+  }
+
+  private async readManagedMediaRoots(runtimeContext?: Record<string, unknown>): Promise<string[]> {
+    if (!Array.isArray(runtimeContext?.managedMediaRoots)) {
+      return [];
+    }
+    const roots: string[] = [];
+    for (const value of runtimeContext.managedMediaRoots) {
+      if (typeof value !== "string" || !value.trim()) {
+        continue;
+      }
+      try {
+        const root = await realpath(resolve(value));
+        if ((await stat(root)).isDirectory()) {
+          roots.push(root);
+        }
+      } catch {
+        // An unavailable root grants no authority.
+      }
+    }
+    return roots;
+  }
+
+  private isInsideManagedRoot(filePath: string, roots: string[]): boolean {
+    return roots.some((root) => {
+      const pathFromRoot = relative(root, filePath);
+      return pathFromRoot === "" || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
+    });
+  }
+
+  private readExternalFileIdentity(externalFile: RuntimeExternalFile): {
+    marker: string;
+    mediaRef: string;
+    managedLocalPath: string;
+    sourceMessageId: string;
+    sourceIndex: number;
+    contentHash: string;
+  } | null {
+    const marker = safeString(externalFile.marker)?.trim();
+    const mediaRef = safeString(externalFile.mediaRef)?.trim();
+    const managedLocalPath = safeString(externalFile.managedLocalPath)?.trim();
+    const sourceMessageId = safeString(externalFile.sourceMessageId)?.trim();
+    const contentHash = safeString(externalFile.contentHash)?.trim();
+    const sourceIndex = externalFile.sourceIndex;
+    if (
+      !marker ||
+      !mediaRef ||
+      !managedLocalPath ||
+      !sourceMessageId ||
+      !contentHash ||
+      typeof sourceIndex !== "number" ||
+      !Number.isInteger(sourceIndex) ||
+      sourceIndex < 0
+    ) {
+      return null;
+    }
+    return { marker, mediaRef, managedLocalPath, sourceMessageId, sourceIndex, contentHash };
+  }
+
+  private buildRuntimeExternalFileId(params: {
+    conversationId: number;
+    mediaRef: string;
+    sourceMessageId: string;
+    sourceIndex: number;
+    contentHash: string;
+  }): string {
+    const digest = createHash("sha256")
+      .update(
+        [
+          params.conversationId,
+          params.mediaRef,
+          params.sourceMessageId,
+          params.sourceIndex,
+          params.contentHash,
+        ].join("\0"),
+      )
+      .digest("hex")
+      .slice(0, 16);
+    return `file_${digest}`;
+  }
+
+  private buildRuntimeExternalFileSummary(params: {
+    externalFile: RuntimeExternalFile;
+    identity: NonNullable<ReturnType<LargeFileInterceptor["readExternalFileIdentity"]>>;
+    managedSourcePath: string;
+    storedPath: string;
+    byteSize: number;
+  }): string {
+    const lines = [
+      "Host-managed media captured from typed OpenClaw runtime metadata.",
+      `Kind: ${safeString(params.externalFile.kind)?.trim() || "file"}`,
+      `Media ref: ${params.identity.mediaRef}`,
+      `Source message id: ${params.identity.sourceMessageId}`,
+      `Source index: ${params.identity.sourceIndex}`,
+      `Content hash: ${params.identity.contentHash}`,
+      `Managed source path: ${params.managedSourcePath}`,
+      `Stored path: ${params.storedPath}`,
+      `Byte size: ${params.byteSize.toLocaleString("en-US")} bytes`,
+    ];
+    const understanding = Array.isArray(params.externalFile.understanding)
+      ? params.externalFile.understanding
+      : [];
+    for (const raw of understanding) {
+      if (!raw || typeof raw !== "object") {
+        continue;
+      }
+      const entry = raw as RuntimeMediaUnderstanding;
+      const kind = safeString(entry.kind)?.trim();
+      const text = safeString(entry.text);
+      const provider = safeString(entry.provider)?.trim();
+      if (!kind || !text || !provider || entry.trust !== "derived_untrusted") {
+        continue;
+      }
+      const model = safeString(entry.model)?.trim();
+      lines.push(
+        "",
+        `[${kind} provider=${provider}${model ? ` model=${model}` : ""} trust=derived_untrusted]`,
+        text,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  private rewriteRuntimeExternalFileMarkers(params: {
+    messages: AgentMessage[];
+    replacements: Map<string, string>;
+  }): AgentMessage[] {
+    if (params.replacements.size === 0) {
+      return params.messages;
+    }
+    let changed = false;
+    const rewriteText = (value: string): string => {
+      let rewritten = value;
+      for (const [marker, replacement] of params.replacements) {
+        rewritten = rewritten.split(marker).join(replacement);
+      }
+      return rewritten;
+    };
+    const messages = params.messages.map((message) => {
+      if (!("content" in message)) {
+        return message;
+      }
+      if (typeof message.content === "string") {
+        const content = rewriteText(message.content);
+        if (content === message.content) {
+          return message;
+        }
+        changed = true;
+        return { ...message, content } as AgentMessage;
+      }
+      if (!Array.isArray(message.content)) {
+        return message;
+      }
+      let contentChanged = false;
+      const content = message.content.map((block) => {
+        const record = asRecord(block);
+        if (!record || record.type !== "text" || typeof record.text !== "string") {
+          return block;
+        }
+        const text = rewriteText(record.text);
+        if (text === record.text) {
+          return block;
+        }
+        contentChanged = true;
+        return { ...record, text };
+      });
+      if (!contentChanged) {
+        return message;
+      }
+      changed = true;
+      return { ...message, content } as AgentMessage;
+    });
+    return changed ? messages : params.messages;
+  }
+
+  async externalizeRuntimeExternalFiles(params: {
+    conversationId: number;
+    messages: AgentMessage[];
+    runtimeContext?: Record<string, unknown>;
+    logWarn?: (message: string) => void;
+  }): Promise<AgentMessage[]> {
+    const externalFiles = this.readRuntimeExternalFiles(params.runtimeContext);
+    if (externalFiles.length === 0) {
+      return params.messages;
+    }
+    const managedRoots = await this.readManagedMediaRoots(params.runtimeContext);
+    const replacements = new Map<string, string>();
+    for (const externalFile of externalFiles) {
+      const identity = this.readExternalFileIdentity(externalFile);
+      if (!identity) {
+        params.logWarn?.(
+          `[lcm] assemble: rejected incomplete typed external file conversation=${params.conversationId}`,
+        );
+        continue;
+      }
+      try {
+        const managedSourcePath = await realpath(resolve(identity.managedLocalPath));
+        const sourceStat = await stat(managedSourcePath);
+        if (!sourceStat.isFile() || !this.isInsideManagedRoot(managedSourcePath, managedRoots)) {
+          throw new Error("path is outside the host-authorized managed media roots");
+        }
+        const fileId = this.buildRuntimeExternalFileId({
+          conversationId: params.conversationId,
+          mediaRef: identity.mediaRef,
+          sourceMessageId: identity.sourceMessageId,
+          sourceIndex: identity.sourceIndex,
+          contentHash: identity.contentHash,
+        });
+        const rawFileName = safeString(externalFile.fileName)?.trim() || basename(managedSourcePath);
+        const fileName = basename(rawFileName) || `${fileId}${extname(managedSourcePath) || ".bin"}`;
+        const mimeType = safeString(externalFile.mimeType)?.trim();
+        const existing = await this.summaryStore.getLargeFile(fileId);
+        let storedPath = existing?.storageUri;
+        if (!existing) {
+          const directory = this.largeFilesDirForConversation(params.conversationId);
+          await mkdir(directory, { recursive: true });
+          const extension = extensionFromNameOrMime(fileName, mimeType);
+          storedPath = join(directory, `${fileId}.${extension}`);
+          await copyFile(managedSourcePath, storedPath);
+          await this.summaryStore.insertLargeFile({
+            fileId,
+            conversationId: params.conversationId,
+            fileName,
+            mimeType,
+            byteSize: sourceStat.size,
+            storageUri: storedPath,
+            explorationSummary: this.buildRuntimeExternalFileSummary({
+              externalFile,
+              identity,
+              managedSourcePath,
+              storedPath,
+              byteSize: sourceStat.size,
+            }),
+          });
+        }
+        replacements.set(
+          identity.marker,
+          formatExternalFileReference({
+            fileId,
+            fileName,
+            mimeType,
+            byteSize: existing?.byteSize ?? sourceStat.size,
+            managedSourcePath,
+            storedPath: storedPath!,
+          }),
+        );
+      } catch (error) {
+        params.logWarn?.(
+          `[lcm] assemble: rejected typed external file conversation=${params.conversationId} error=${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return this.rewriteRuntimeExternalFileMarkers({ messages: params.messages, replacements });
+  }
+
+  async externalizeInlinePayloadsForOverflow(params: {
+    conversationId: number;
+    messages: AgentMessage[];
+    tokenBudget: number;
+  }): Promise<{
+    messages: AgentMessage[];
+    estimatedTokens: number;
+    externalizedCount: number;
+  }> {
+    let messages = params.messages;
+    let estimatedTokens = estimateAgentMessageTokens(messages);
+    let externalizedCount = 0;
+    if (estimatedTokens <= params.tokenBudget) {
+      return { messages, estimatedTokens, externalizedCount };
+    }
+    const candidates = messages
+      .map((message, index) => {
+        const role = message.role;
+        const allowed =
+          (role === "user" && this.config.rawUserPayloadMode === "inline") ||
+          ((role === "tool" || role === "toolResult") &&
+            this.config.toolResultPayloadMode === "inline");
+        const rawContent = "content" in message ? message.content : undefined;
+        const content =
+          typeof rawContent === "string"
+            ? rawContent
+            : role === "tool" || role === "toolResult"
+              ? extractStructuredText(rawContent)
+              : undefined;
+        if (!allowed || typeof content !== "string") {
+          return null;
+        }
+        const tokenCount = estimateTokens(content);
+        if (
+          tokenCount < this.config.largeFileTokenThreshold ||
+          LargeFileInterceptor.isExternalizedReferenceContent(content)
+        ) {
+          return null;
+        }
+        return { index, role, content, tokenCount, structured: typeof rawContent !== "string" };
+      })
+      .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
+      .sort((left, right) => right.tokenCount - left.tokenCount || left.index - right.index);
+
+    for (const candidate of candidates) {
+      if (estimatedTokens <= params.tokenBudget) {
+        break;
+      }
+      const fileId = `file_${createHash("sha256")
+        .update(`${params.conversationId}\0${candidate.role}\0${candidate.content}`)
+        .digest("hex")
+        .slice(0, 16)}`;
+      const isTool = candidate.role === "tool" || candidate.role === "toolResult";
+      const externalized = await this.externalizeLargeTextPayload({
+        conversationId: params.conversationId,
+        content: candidate.content,
+        fileId,
+        fileName: isTool ? "tool-result.txt" : "raw-user-payload.txt",
+        mimeType: "text/plain",
+        formatReference: ({ fileId: id, byteSize, summary }) =>
+          isTool
+            ? formatToolOutputReference({
+                fileId: id,
+                toolName: "tool-result",
+                byteSize,
+                summary,
+              })
+            : formatRawPayloadReference({
+                fileId: id,
+                role: "user",
+                byteSize,
+                reason: "assembly_overflow",
+                summary,
+              }),
+      });
+      messages = messages.slice();
+      messages[candidate.index] = {
+        ...messages[candidate.index],
+        content: candidate.structured
+          ? [{ type: "text", text: externalized.reference }]
+          : externalized.reference,
+        payloadExternalized: true,
+        externalizedFileId: externalized.fileId,
+        externalizationReason: "assembly_overflow",
+      } as AgentMessage;
+      estimatedTokens = estimateAgentMessageTokens(messages);
+      externalizedCount += 1;
+    }
+    return { messages, estimatedTokens, externalizedCount };
   }
 
   private async storeImageFileContent(params: {

@@ -512,6 +512,23 @@ export function formatFileReference(input: {
   ].join("\n");
 }
 
+export function formatExternalFileReference(input: {
+  fileId: string;
+  fileName: string;
+  mimeType?: string;
+  byteSize: number;
+  managedSourcePath: string;
+  storedPath: string;
+}): string {
+  const mimeType = input.mimeType?.trim() || "unknown";
+  return [
+    `[LCM File: ${input.fileId} | ${input.fileName} | ${mimeType} | ${Math.max(0, input.byteSize).toLocaleString("en-US")} bytes]`,
+    `Managed source path: ${input.managedSourcePath}`,
+    `Stored path: ${input.storedPath}`,
+    `Call lcm_describe(id="${input.fileId}", expandFile=true) for details.`,
+  ].join("\n");
+}
+
 export function formatToolOutputReference(input: {
   fileId: string;
   toolName?: string;

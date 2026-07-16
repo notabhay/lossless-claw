@@ -265,6 +265,35 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("keeps oversized authored user text inline when configured", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({
+        largeFileTokenThreshold: 20,
+        rawUserPayloadMode: "inline",
+      });
+      const sessionId = randomUUID();
+      const rawText = `${"authored inbound line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: rawText }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.content).toBe(rawText);
+      await expect(
+        engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId),
+      ).resolves.toHaveLength(0);
+    });
+  });
+
   it("externalizes oversized non-file non-tool raw payloads", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
@@ -1019,6 +1048,48 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("keeps oversized tool results inline when configured", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({
+        largeFileTokenThreshold: 20,
+        toolResultPayloadMode: "inline",
+      });
+      const sessionId = randomUUID();
+      const toolOutput = `${"inline tool output line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_inline",
+          toolName: "exec",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_inline",
+              name: "exec",
+              content: [{ type: "text", text: toolOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.content).toContain(toolOutput.slice(0, 64));
+      expect(messages[0]?.content).not.toContain("[LCM Tool Output: file_");
+      await expect(
+        engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId),
+      ).resolves.toHaveLength(0);
+    });
+  });
+
   it("keeps oversized lcm_describe tool results inline instead of re-externalizing", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
@@ -1622,4 +1693,3 @@ describe("LcmContextEngine.ingest content extraction", () => {
     ]);
   });
 });
-

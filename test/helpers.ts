@@ -56,6 +56,8 @@ export function createTestConfig(
     freshTailCount: 8,
     promptAwareEviction: false,
     stubLargeToolPayloads: false,
+    rawUserPayloadMode: "externalize-large",
+    toolResultPayloadMode: "externalize-large",
     newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,

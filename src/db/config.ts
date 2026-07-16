@@ -80,6 +80,7 @@ export type ContextThresholdOverride = {
 };
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
+export type PayloadMode = "externalize-large" | "inline";
 
 export type LcmConfigDiagnostics = {
   ignoreSessionPatternsSource: LcmConfigSource;
@@ -116,6 +117,10 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /** Keep authored user payloads inline until assembly genuinely exceeds its budget. */
+  rawUserPayloadMode: PayloadMode;
+  /** Keep tool results inline until assembly genuinely exceeds its budget. */
+  toolResultPayloadMode: PayloadMode;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -326,6 +331,14 @@ function toProactiveThresholdCompactionMode(
 ): ProactiveThresholdCompactionMode | undefined {
   const normalized = toStr(value)?.toLowerCase();
   if (normalized === "inline" || normalized === "deferred") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function toPayloadMode(value: unknown): PayloadMode | undefined {
+  const normalized = toStr(value)?.toLowerCase();
+  if (normalized === "externalize-large" || normalized === "inline") {
     return normalized;
   }
   return undefined;
@@ -718,6 +731,14 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      rawUserPayloadMode:
+        toPayloadMode(env.LCM_RAW_USER_PAYLOAD_MODE)
+          ?? toPayloadMode(pc.rawUserPayloadMode)
+          ?? "externalize-large",
+      toolResultPayloadMode:
+        toPayloadMode(env.LCM_TOOL_RESULT_PAYLOAD_MODE)
+          ?? toPayloadMode(pc.toolResultPayloadMode)
+          ?? "externalize-large",
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,
