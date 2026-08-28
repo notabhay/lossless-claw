@@ -28,6 +28,7 @@
     "plugin-inspector:ci": "npm exec --yes --package @openclaw/plugin-inspector@0.3.11 -- plugin-inspector ci --plugin-root . --out plugin-inspector-reports",
     "release:verify": "npm run typecheck && npm run build && npm test && npm run test:tui && npm pack --dry-run",
     "test": "vitest run --dir test",
+    "test:host-sdk": "vitest run --config vitest.host-sdk.config.ts test/index-runtime-llm-complete.test.ts",
     "test:tui": "cd tui && go test ./...",
     "typecheck": "tsc --noEmit --pretty false",
     "version-packages": "changeset version"
@@ -57,7 +58,7 @@
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.7.2-beta.2"
+    "openclaw": ">=2026.7.1"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -72,14 +73,15 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.7.2-beta.2",
-      "minGatewayVersion": "2026.7.2-beta.2",
+      "pluginApi": ">=2026.7.1",
+      "minGatewayVersion": "2026.7.1",
       "tested": [
+        "2026.7.1",
         "2026.7.2-beta.2"
       ]
     },
     "build": {
-      "openclawVersion": "2026.7.2-beta.2"
+      "openclawVersion": "2026.7.1"
     }
   },
   "repository": {

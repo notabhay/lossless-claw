@@ -63,6 +63,7 @@ export function trimMessagesToBudget(
  */
 export const SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO = 0.9;
 
+
 /**
  * Final budget clamp on assembled output, measured by serialized
  * (model-boundary) token estimate rather than stored-content counts.
@@ -192,9 +193,17 @@ export function buildDegradedLiveAssembleResult(params: {
     protectedPrefix.push(withoutAssistantPrefill[protectedPrefix.length]!);
   }
   const liveTail = withoutAssistantPrefill.slice(protectedPrefix.length);
+  // This path declares that the host will add its own prompt framing after
+  // receiving the live suffix. Keep the same explicit renderer headroom as
+  // every other bounded assembly path, or a near-budget degradation can
+  // immediately trip the host precheck before a later turn can reconcile.
+  const targetBudget = Math.max(
+    1,
+    Math.floor(params.tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
+  );
   const remainingBudget = Math.max(
     0,
-    Math.floor(params.tokenBudget) - estimateAgentMessageTokens(protectedPrefix),
+    targetBudget - estimateAgentMessageTokens(protectedPrefix),
   );
   let liveTailMessages = trimMessagesToBudget(liveTail, remainingBudget, prefillOptions);
   if (liveTailMessages.length === 0 && liveTail.length > 0) {

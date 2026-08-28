@@ -133,9 +133,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         model: "gpt-5.5",
       }),
     );
-    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).not.toHaveProperty(
-      "runtimeModelOverride",
-    );
+    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+      runtimeModelOverride: {
+        configField: "effective runtime model",
+        configPath: "runtime default selection",
+        modelRef: "openai-codex/gpt-5.5",
+      },
+    });
   });
 
   it("plugin summaryProvider alone (no summaryModel) is ignored and falls back to legacy provider", async () => {
@@ -1462,6 +1466,11 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
         provider: "anthropic",
         model: "claude-sonnet-4-6",
+        runtimeModelOverride: {
+          configField: "agents.defaults.model",
+          configPath: "agents.defaults.model",
+          modelRef: "anthropic/claude-sonnet-4-6",
+        },
       });
 
       const diagnostics = getDepsLogText(deps);

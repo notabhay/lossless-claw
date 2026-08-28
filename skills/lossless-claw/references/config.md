@@ -154,6 +154,24 @@ Good default:
 - `false`
 - enable it only after migration and live validation
 
+### `rawUserPayloadMode`
+
+Controls oversized authored user payloads.
+
+- `externalize-large` uses upstream eager externalization.
+- `inline` preserves exact authored content until the assembled prompt genuinely exceeds its budget, then writes one stable recoverable reference.
+
+Good default: `externalize-large`. Brodie uses `inline` because its typed inbound envelope is source evidence.
+
+### `toolResultPayloadMode`
+
+Controls oversized tool results.
+
+- `externalize-large` uses upstream eager externalization.
+- `inline` preserves the exact result until the assembled prompt genuinely exceeds its budget, then writes one stable recoverable reference without breaking tool-call pairing.
+
+Good default: `externalize-large`. Use `inline` only when exact inline tool history is required.
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -603,12 +621,18 @@ See high-impact settings above.
 
 ### `delegationTimeoutMs`
 
-Maximum wall-clock budget for delegated recall work across one `lcm_expand_query` call. Cross-conversation buckets share this deadline, and the tool keeps 30 seconds of RPC headroom for cancellation, cleanup, and result delivery.
+Maximum wall-clock budget for explicit `mode: "forensic"` delegated recall work across one `lcm_expand_query` call. Cross-conversation buckets share this deadline, and forensic mode keeps 30 seconds of RPC headroom for cancellation, cleanup, and result delivery.
 
 Why it matters:
 
 - lower values fail faster under slow sub-agent paths
 - higher values give the bounded recall request more time to finish
+
+### `normalDelegationTimeoutMs`
+
+Maximum work budget for default `mode: "normal"` delegated recall. It defaults to `30000` and is capped at that value. Normal mode reserves 5000ms for cancellation, cleanup, and result delivery, so caller-supplied timeouts cannot make it exceed 35000ms total.
+
+The child limits are prompt restrictions only. OpenClaw 2026.7.1 does not expose a recall-only child-tool allowlist.
 
 ### `maxAssemblyTokenBudget`
 

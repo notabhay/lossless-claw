@@ -2,11 +2,12 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.7.2-beta.2` or newer so the host can provide
-the branch-safe visible transcript projection used during SQLite session bootstrap
-and enforce context-engine runtime capabilities before an agent run starts. That
-beta is the first published build with the required API; stable `2026.7.1` does
-not provide it.
+Lossless-claw requires OpenClaw `2026.7.1` or newer. Hosts at `2026.7.2-beta.2` or
+newer provide the branch-safe visible transcript projection natively; on `2026.7.1`
+the plugin rebuilds that projection from the host's raw JSONL transcript events with
+the host's own active-branch selection, so bootstrap and after-turn reconciliation
+behave the same way. The selected source is logged once at startup as
+`transcript projection source=host-native` or `source=jsonl-compat`.
 Agent runs need a native host that provides the full context-engine lifecycle:
 session bootstrap, pre-prompt assembly, after-turn ingestion, maintenance,
 compaction, and runtime LLM completion. Native Codex and Pi embedded runs provide
@@ -124,6 +125,8 @@ host policy.
   "freshTailMaxTokens": 24000,
   "promptAwareEviction": false,
   "stubLargeToolPayloads": false,
+  "rawUserPayloadMode": "externalize-large",
+  "toolResultPayloadMode": "externalize-large",
   "newSessionRetainDepth": 2,
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
@@ -146,6 +149,7 @@ host policy.
   "largeFileSummaryModel": "",
   "expansionProvider": "",
   "expansionModel": "",
+  "normalDelegationTimeoutMs": 30000,
   "delegationTimeoutMs": 120000,
   "summaryTimeoutMs": 60000,
   "summaryCallWindowMs": 600000,
@@ -284,10 +288,12 @@ Lossless-claw writes routine operational JSONL logs by default at `/tmp/openclaw
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
 | `contextThresholdOverrides` | `Array<{ name?: string; match: object; contextThreshold: number; freshTailCount?: integer; leafChunkTokens?: integer }>` | `[]` | none | Optional ordered rules that override `contextThreshold` and, optionally, `freshTailCount` and `leafChunkTokens` by model id, model context-window range, or session glob pattern. |
-| `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
-| `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
+| `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. If this count would split the newest user turn, the protected tail expands to include that user and its following assistant/tool suffix. |
+| `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest user message and its following assistant/tool suffix are always preserved even if they exceed the cap. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
 | `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
+| `rawUserPayloadMode` | `"externalize-large" \| "inline"` | `"externalize-large"` | `LCM_RAW_USER_PAYLOAD_MODE` | `inline` preserves exact authored payloads until a real assembly overflow, then writes one recoverable file reference. |
+| `toolResultPayloadMode` | `"externalize-large" \| "inline"` | `"externalize-large"` | `LCM_TOOL_RESULT_PAYLOAD_MODE` | `inline` preserves exact tool results until a real assembly overflow, then writes one recoverable file reference. |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
@@ -324,14 +330,15 @@ LCM-assembled compact view instead of unbounded raw parent history.
 | `largeFileSummaryProvider` | `string` | `""` | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | Large-file summarizer provider hint for bare model names. |
 | `expansionModel` | `string` | `""` | `LCM_EXPANSION_MODEL` | `lcm_expand_query` sub-agent model override. |
 | `expansionProvider` | `string` | `""` | `LCM_EXPANSION_PROVIDER` | `lcm_expand_query` sub-agent provider hint for bare model names. |
-| `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum wall-clock budget for delegated expansion work across one `lcm_expand_query` call. Cross-conversation buckets share this deadline. The dynamic tool advertises a `timeoutMs` default with 30 seconds of extra RPC headroom for cancellation, cleanup, and result delivery. |
+| `normalDelegationTimeoutMs` | `integer` | `30000` | `LCM_NORMAL_DELEGATION_TIMEOUT_MS` | Maximum end-to-end work time for default `mode: "normal"` recall, including LCM initialization, scope resolution, and candidate discovery before child work. Values are capped at 30000ms; normal requests reserve 5000ms for cancellation, cleanup, and result delivery and never exceed 35000ms total. |
+| `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum wall-clock work budget for explicit `mode: "forensic"` delegated expansion. Cross-conversation buckets share this deadline. Forensic requests reserve 30 seconds of RPC headroom for cancellation, cleanup, and result delivery. |
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `summaryCallWindowMs` | `integer` | `600000` | `LCM_SUMMARY_CALL_WINDOW_MS` | Rolling window for the per-session summarization spend guard. |
 | `summaryMaxCallsPerWindow` | `integer` | `24` | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | Maximum model-backed summarization calls per session/window before Lossless opens a non-auth spend backoff. |
 | `summarySpendBackoffMs` | `integer` | `1800000` | `LCM_SUMMARY_SPEND_BACKOFF_MS` | Cooldown after the summarization spend guard opens. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
-Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models. Delegated expansion calls use OpenClaw's runtime sub-agent layer; explicit `expansionModel` values require `plugins.entries.lossless-claw.subagent.allowModelOverride` and a matching `subagent.allowedModels` entry, or `"*"` if you intentionally trust any expansion target. `openclaw doctor --fix` can add the minimal subagent policy, and `lcm_expand_query` retries once without the override if the host rejects it.
+Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. Every resolved summary candidate, including OpenClaw defaults and runtime/session hints, must be permitted under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for statically configured summary candidates. Runtime/session candidates are checked when selected and need matching allowlist entries. Delegated expansion calls use OpenClaw's runtime sub-agent layer; explicit `expansionModel` values require `plugins.entries.lossless-claw.subagent.allowModelOverride` and a matching `subagent.allowedModels` entry, or `"*"` if you intentionally trust any expansion target. `openclaw doctor --fix` can add the minimal subagent policy, and forensic `lcm_expand_query` retries once without the override if the host rejects it. Normal mode returns the first override failure so it never creates a second child. OpenClaw 2026.7.1 cannot enforce a recall-only child-tool allowlist, so normal mode's tool limits are prompt restrictions, not a sandbox.
 
 ### Fallbacks, circuit breaking, and safety rails
 
@@ -411,8 +418,11 @@ Compaction summarization resolves candidates in this order:
 1. `LCM_SUMMARY_MODEL` and `LCM_SUMMARY_PROVIDER`
 2. `plugins.entries.lossless-claw.config.summaryModel` and `summaryProvider`
 3. OpenClaw's default compaction model
-4. Runtime/session provider and model hints from OpenClaw
-5. `fallbackProviders`
+4. OpenClaw's default primary model
+5. Runtime/session provider and model hints from OpenClaw
+6. `fallbackProviders`
+
+OpenClaw's generic agent fallback list is not automatically an LCM fallback chain. Duplicate candidates are tried once.
 
 If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
 

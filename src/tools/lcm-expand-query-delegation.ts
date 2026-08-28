@@ -4,7 +4,11 @@ import {
   revokeDelegatedExpansionGrantForSession,
 } from "../expansion-auth.js";
 import type { LcmDependencies } from "../types.js";
-import { remainingDeadlineMs, type ExpansionDeadline } from "./lcm-expansion-deadline.js";
+import {
+  remainingDeadlineMs,
+  type ExpansionDeadline,
+  type ExpandQueryMode,
+} from "./lcm-expansion-deadline.js";
 import { normalizeSummaryIds } from "./lcm-expand-tool.delegation.js";
 import {
   clearDelegatedExpansionContext,
@@ -14,12 +18,80 @@ import {
 
 const GATEWAY_TIMEOUT_MS = 10_000;
 
+class DelegatedGatewayDeadlineError extends Error {
+  constructor() {
+    super("lcm_expand_query delegated gateway call exceeded its deadline.");
+  }
+}
+
+/**
+ * The OpenClaw subagent API honors a timeout only for waitForRun. Keep every
+ * other call inside the caller's absolute deadline here, at the LCM boundary.
+ * The host API currently has no cancellation signal for run/get/delete, so a
+ * losing RPC may finish later but can neither delay the result nor the slot.
+ */
+async function callDelegatedGatewayWithinDeadline<T>(params: {
+  operation: Promise<T>;
+  deadlineMs: number;
+}): Promise<T> {
+  const remainingMs = remainingDeadlineMs(params.deadlineMs, performance.now());
+  if (remainingMs <= 0) {
+    throw new DelegatedGatewayDeadlineError();
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      params.operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new DelegatedGatewayDeadlineError()), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * `agent` acknowledges only after the gateway has accepted the child, but a
+ * local deadline can still win before that acknowledgement reaches this
+ * plugin. The first cleanup attempt can then race before session creation.
+ * Once that delayed acknowledgement settles, delete the deterministic child
+ * key again. The idempotent session delete also aborts any queued/running work.
+ */
+function scheduleLateSpawnCleanup(params: {
+  spawnOperation: Promise<unknown>;
+  deps: LcmDependencies;
+  childSessionKey: string;
+}) {
+  void params.spawnOperation.then(
+    async () => {
+      try {
+        await callDelegatedGatewayWithinDeadline({
+          deadlineMs: performance.now() + GATEWAY_TIMEOUT_MS,
+          operation: params.deps.callGateway({
+            method: "sessions.delete",
+            params: { key: params.childSessionKey, deleteTranscript: true },
+            timeoutMs: GATEWAY_TIMEOUT_MS,
+          }),
+        });
+      } catch {
+        // The original request has already returned. This detached attempt
+        // never retains an LCM grant or origin-concurrency slot.
+      }
+    },
+    () => undefined,
+  );
+}
+
 export type DelegatedExpandQueryReply = {
   answer: string;
   citedIds: string[];
   expandedSummaryCount: number;
   totalSourceTokens: number;
   truncated: boolean;
+  mode: ExpandQueryMode;
 };
 
 export type DelegatedFailurePhase = "spawn" | "wait" | "read_reply" | "parse_reply";
@@ -38,6 +110,7 @@ export type DelegatedBucketOutcome =
       summaryIds: string[];
       elapsedMs: number;
       reply: DelegatedExpandQueryReply;
+      mode: ExpandQueryMode;
     }
   | {
       status: "failed";
@@ -49,6 +122,7 @@ export type DelegatedBucketOutcome =
       error: string;
       timedOut: boolean;
       cleanup: "complete" | "partial";
+      mode: ExpandQueryMode;
     };
 
 export type DelegatedConversationBucket = {
@@ -58,7 +132,7 @@ export type DelegatedConversationBucket = {
 };
 
 type ParsedExpandQueryReply =
-  | { ok: true; value: DelegatedExpandQueryReply }
+  | { ok: true; value: Omit<DelegatedExpandQueryReply, "mode"> }
   | { ok: false; error: string };
 
 type RunDelegatedExpandQueryParams = {
@@ -75,6 +149,7 @@ type RunDelegatedExpandQueryParams = {
   originSessionKey: string;
   deadline: ExpansionDeadline;
   delegatedWaitTimeoutSeconds: number;
+  mode: ExpandQueryMode;
 };
 
 // Collect nested gateway/provider failure text without exposing object formatting artifacts.
@@ -184,6 +259,7 @@ function buildDelegatedExpandQueryTask(params: {
   requestId: string;
   expansionDepth: number;
   originSessionKey: string;
+  mode: ExpandQueryMode;
 }) {
   const seedSummaryIds = params.summaryIds.length > 0 ? params.summaryIds.join(", ") : "(none)";
   const messageBackedSummaryIds =
@@ -201,12 +277,22 @@ function buildDelegatedExpandQueryTask(params: {
     params.query ? `Routing query: ${params.query}` : undefined,
     "",
     "Strategy:",
-    "1. Start with `lcm_describe` on seed summaries to inspect subtree manifests and branch costs.",
-    "2. If additional candidates are needed, use `lcm_grep` scoped to summaries. Prefer `mode: \"full_text\"` for short literal terms, use `mode: \"regex\"` for alternation or other regex syntax, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic recall, and `sort: \"hybrid\"` when recency should still matter.",
-    "3. Select branches that fit remaining budget; prefer high-signal paths first.",
-    "4. Call `lcm_expand` selectively (do not expand everything blindly).",
-    "5. Keep includeMessages=false by default; use includeMessages=true for the message-backed seed summaries above and any other specific leaf evidence.",
-    `6. Stay within ${params.tokenCap} total expansion tokens across all lcm_expand calls.`,
+    ...(params.mode === "normal"
+      ? [
+          "1. Inspect at most two seed summaries with `lcm_describe`.",
+          "2. When seed summaries exist, do not call `lcm_grep`; select the highest-signal paths from those summaries.",
+          "3. When no seed summary exists, make at most one summary-scoped `lcm_grep` before selecting a path.",
+          "4. Call `lcm_expand` on at most two high-signal paths. Keep includeMessages=false unless one named leaf requires exact evidence.",
+          `5. Stay within ${params.tokenCap} total expansion tokens. If the bounded pass cannot settle the question, return the evidence you have with truncated: true. Do not make more tool calls.`,
+        ]
+      : [
+          "1. Start with `lcm_describe` on seed summaries to inspect subtree manifests and branch costs.",
+          "2. If additional candidates are needed, use `lcm_grep` scoped to summaries. Prefer `mode: \"full_text\"` for short literal terms, use `mode: \"regex\"` for alternation or other regex syntax, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic recall, and `sort: \"hybrid\"` when recency should still matter.",
+          "3. Select branches that fit remaining budget; prefer high-signal paths first.",
+          "4. Call `lcm_expand` selectively (do not expand everything blindly).",
+          "5. Keep includeMessages=false by default; use includeMessages=true for the message-backed seed summaries above and any other specific leaf evidence.",
+          `6. Stay within ${params.tokenCap} total expansion tokens across all lcm_expand calls.`,
+        ]),
     "",
     "User prompt to answer:",
     params.prompt,
@@ -215,6 +301,7 @@ function buildDelegatedExpandQueryTask(params: {
     `- requestId: ${params.requestId}`,
     `- expansionDepth: ${params.expansionDepth}`,
     `- originSessionKey: ${params.originSessionKey}`,
+    `- mode: ${params.mode}`,
     "",
     "Return ONLY JSON with this shape:",
     "{",
@@ -320,6 +407,7 @@ async function runDelegatedQueryAttempt(
   let phase: DelegatedFailurePhase = "spawn";
   let timedOut = false;
   let sessionCleanupComplete = false;
+  let spawnOperation: Promise<unknown> | undefined;
   let outcome: DelegatedBucketOutcome;
 
   try {
@@ -360,7 +448,7 @@ async function runDelegatedQueryAttempt(
         remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now()),
       ),
     );
-    const response = (await params.deps.callGateway({
+    spawnOperation = params.deps.callGateway({
       method: "agent",
       params: {
         message: params.task,
@@ -377,6 +465,10 @@ async function runDelegatedQueryAttempt(
         }),
       },
       timeoutMs: spawnTimeoutMs,
+    });
+    const response = (await callDelegatedGatewayWithinDeadline({
+      deadlineMs: params.deadline.workDeadlineMs,
+      operation: spawnOperation,
     })) as { runId?: unknown; error?: unknown };
 
     runId = typeof response?.runId === "string" ? response.runId.trim() : "";
@@ -393,10 +485,13 @@ async function runDelegatedQueryAttempt(
       1,
       remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now()),
     );
-    const wait = (await params.deps.callGateway({
-      method: "agent.wait",
-      params: { runId, timeoutMs: waitTimeoutMs },
-      timeoutMs: waitTimeoutMs,
+    const wait = (await callDelegatedGatewayWithinDeadline({
+      deadlineMs: params.deadline.workDeadlineMs,
+      operation: params.deps.callGateway({
+        method: "agent.wait",
+        params: { runId, timeoutMs: waitTimeoutMs },
+        timeoutMs: waitTimeoutMs,
+      }),
     })) as { status?: string; error?: unknown };
     const status = typeof wait?.status === "string" ? wait.status : "error";
     if (status === "timeout") {
@@ -410,6 +505,7 @@ async function runDelegatedQueryAttempt(
         expansionDepth: params.childExpansionDepth,
         originSessionKey: params.originSessionKey,
         runId,
+        mode: params.mode,
       });
       throw new Error(
         `lcm_expand_query timed out waiting for delegated expansion (${params.delegatedWaitTimeoutSeconds}s).`,
@@ -431,10 +527,13 @@ async function runDelegatedQueryAttempt(
       );
     }
     phase = "read_reply";
-    const replyPayload = (await params.deps.callGateway({
-      method: "sessions.get",
-      params: { key: childSessionKey, limit: 80 },
-      timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, replyTimeoutMs),
+    const replyPayload = (await callDelegatedGatewayWithinDeadline({
+      deadlineMs: params.deadline.workDeadlineMs,
+      operation: params.deps.callGateway({
+        method: "sessions.get",
+        params: { key: childSessionKey, limit: 80 },
+        timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, replyTimeoutMs),
+      }),
     })) as { messages?: unknown[] };
     const reply = params.deps.readLatestAssistantReply(
       Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
@@ -456,16 +555,26 @@ async function runDelegatedQueryAttempt(
       expansionDepth: params.childExpansionDepth,
       originSessionKey: params.originSessionKey,
       runId,
+      mode: params.mode,
     });
     outcome = {
       status: "success",
       conversationId: params.bucket.conversationId,
       summaryIds: params.bucket.summaryIds,
       elapsedMs: 0,
-      reply: parsed.value,
+      reply: { ...parsed.value, mode: params.mode },
+      mode: params.mode,
     };
   } catch (error) {
     // Expected gateway and reply failures become typed outcomes for public accounting.
+    timedOut ||= error instanceof DelegatedGatewayDeadlineError;
+    if (phase === "spawn" && error instanceof DelegatedGatewayDeadlineError && spawnOperation) {
+      scheduleLateSpawnCleanup({
+        spawnOperation,
+        deps: params.deps,
+        childSessionKey,
+      });
+    }
     outcome = {
       status: "failed",
       conversationId: params.bucket.conversationId,
@@ -476,6 +585,7 @@ async function runDelegatedQueryAttempt(
       error: formatExpansionFailure(error),
       timedOut,
       cleanup: "partial",
+      mode: params.mode,
     };
   } finally {
     // The host-owned deletion path cancels active child work before removing its session.
@@ -488,10 +598,13 @@ async function runDelegatedQueryAttempt(
       sessionCleanupComplete = true;
     } else if (cleanupTimeoutMs > 0) {
       try {
-        await params.deps.callGateway({
-          method: "sessions.delete",
-          params: { key: childSessionKey, deleteTranscript: true },
-          timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, cleanupTimeoutMs),
+        await callDelegatedGatewayWithinDeadline({
+          deadlineMs: params.deadline.totalDeadlineMs,
+          operation: params.deps.callGateway({
+            method: "sessions.delete",
+            params: { key: childSessionKey, deleteTranscript: true },
+            timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, cleanupTimeoutMs),
+          }),
         });
         sessionCleanupComplete = true;
       } catch {
@@ -530,6 +643,7 @@ export async function runDelegatedExpandQuery(
     requestId: params.requestId,
     expansionDepth: params.childExpansionDepth,
     originSessionKey: params.originSessionKey,
+    mode: params.mode,
   });
   const expansionProvider = params.deps.config.expansionProvider || undefined;
   const expansionModel = params.deps.config.expansionModel || undefined;
@@ -556,7 +670,7 @@ export async function runDelegatedExpandQuery(
   params.deps.log.warn(
     `[lcm] delegated expansion override failed (${overrideLabel}) for conversation ${params.bucket.conversationId}: ${outcome.error}`,
   );
-  if (!shouldRetryWithoutOverride(outcome.error)) {
+  if (params.mode === "normal" || !shouldRetryWithoutOverride(outcome.error)) {
     return outcome;
   }
   params.deps.log.warn(

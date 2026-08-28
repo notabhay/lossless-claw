@@ -106,6 +106,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         messages: Array<{ role: string; content: unknown }>;
         maxTokens: number;
         temperature?: number;
+        reasoning?: string;
         reasoningIfSupported?: string;
       }) => Promise<CompletionResult>;
       resolveModel: (modelRef?: string, providerHint?: string) => {
@@ -124,6 +125,12 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("loads the exact host transcript runtime public export used by the compatibility reader", async () => {
+    const runtime = await import("openclaw/plugin-sdk/session-transcript-runtime");
+
+    expect(typeof runtime.readSessionTranscriptEvents).toBe("function");
   });
 
   it("delegates model dispatch and auth to api.runtime.llm.complete without target-agent override", async () => {
@@ -165,6 +172,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         systemPrompt: "System summary policy.",
         purpose: "lossless-claw compaction summarization",
         authProfileId: "openai-codex:work",
+        reasoning: "low",
       });
       expect(result).toMatchObject({
         content: [{ type: "text", text: "summary output" }],
@@ -290,7 +298,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
-  it("does not request a runtime model override for session/default candidates", async () => {
+  it("does not invent a runtime model override when no resolved candidate supplies one", async () => {
     const runtimeLlmComplete = vi.fn(async () => ({
       text: "summary output",
       provider: "anthropic",
@@ -313,6 +321,36 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
           model: expect.any(String),
         }),
       );
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("preserves a host completion failure as an empty structured error result", async () => {
+    const runtimeLlmComplete = vi.fn(async () => {
+      throw new Error("host rejected completion");
+    });
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      const result = await engine.deps.complete({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        runtimeModelOverride: {
+          configField: "agents.defaults.model",
+          configPath: "agents.defaults.model",
+          modelRef: "openai-codex/gpt-5.4",
+        },
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+      });
+
+      expect(result.content).toEqual([]);
+      expect(result.error).toMatchObject({
+        kind: "provider_error",
+        message: expect.stringContaining("host rejected completion"),
+      });
     } finally {
       closeLcmConnection(dbPath);
     }

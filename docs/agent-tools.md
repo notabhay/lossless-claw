@@ -4,13 +4,13 @@ LCM provides four tools for agents to search, inspect, and recall information fr
 
 ## Usage patterns
 
-### Escalation pattern: grep → describe → expand_query
+### Escalation pattern: archive/journal/memory → grep → describe → expand_query
 
-Most recall tasks follow this escalation:
+For room history, same-day state, or workspace context, first use the authoritative channel archive or omniscience surface, current journal, or memory search. For compacted conversation history, use this escalation:
 
 1. **`lcm_grep`** — Find relevant summaries, messages, or externalized file prefixes by keyword/regex
 2. **`lcm_describe`** — Inspect a specific summary's full content (cheap, no sub-agent)
-3. **`lcm_expand_query`** — Deep recall: spawn a sub-agent to expand the DAG and answer a focused question
+3. **`lcm_expand_query`** — Last-resort deep recall: spawn a sub-agent to expand the DAG and answer a focused question
 
 Start with grep. If the snippet is enough, stop. If you need full summary content, use describe. If you need details that were compressed away, use expand_query.
 
@@ -24,7 +24,7 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 - Tool call sequences and their outputs
 - Verbatim quotes or specific data points
 
-`lcm_expand_query` is bounded (~120s, scoped sub-agent) and relatively cheap. Don't ration it, but use `lcm_grep` first when you need broad discovery across many sessions.
+`lcm_expand_query` defaults to `mode: "normal"`, a 30-second work pass with 5 seconds of cleanup/RPC headroom. It is for a small, live-chat-safe recovery after grep and describe cannot settle the question. Use `mode: "forensic"` only for an explicit long investigation. It keeps the configured 120-second work budget plus 30 seconds of cleanup/RPC headroom. On OpenClaw 2026.7.1, normal mode's limited child-tool workflow is prompt-restricted rather than host-enforced.
 
 ## Tool reference
 
@@ -119,7 +119,7 @@ lcm_describe(id: "file_789abc012345")
 
 Answer a focused question by expanding summaries through the DAG. Spawns a bounded sub-agent that walks parent links down to source material and returns a compact answer.
 
-When `allConversations: true` is set, `lcm_expand_query` can synthesize one answer across multiple conversations. That cross-conversation mode is bounded, not exhaustive: it ranks conversation buckets, expands only the top few under one shared deadline, and marks the result truncated when lower-ranked buckets are skipped or fail. The selected buckets share the existing `tokenCap`, so concurrent recall does not multiply the retrieval budget.
+When `allConversations: true` is set, `lcm_expand_query` requires `mode: "forensic"` and can synthesize one answer across multiple conversations. That cross-conversation mode is bounded, not exhaustive: it ranks conversation buckets, expands only the top few under one shared deadline, and marks the result truncated when lower-ranked buckets are skipped or fail. The selected buckets share the existing `tokenCap`, so concurrent recall does not multiply the retrieval budget.
 
 **Parameters:**
 
@@ -129,7 +129,8 @@ When `allConversations: true` is set, `lcm_expand_query` can synthesize one answ
 | `query` | string | ✅* | — | Text query to find summaries (if no `summaryIds`) |
 | `summaryIds` | string[] | ✅* | — | Specific summary IDs to expand (if no `query`) |
 | `maxTokens` | number | | 2000 | Answer length cap |
-| `timeoutMs` | number | ✅ | `delegationTimeoutMs + 30000` | Total OpenClaw dynamic tool RPC timeout; use the schema default so delegated recall can finish before the host watchdog fires |
+| `mode` | `"normal" \| "forensic"` | | `"normal"` | Normal is capped at 35000ms total. Forensic opts into the configured long deep-recall budget. |
+| `timeoutMs` | number | | mode-specific runtime default: `35000` normal; `delegationTimeoutMs + 30000` forensic | Total OpenClaw dynamic tool RPC timeout. The schema intentionally has no static default because it cannot express a mode-dependent value. Normal requests are clamped to 35000ms. |
 | `conversationId` | number | | current session family | Scope to a specific physical conversation |
 | `allConversations` | boolean | | `false` | Search across all conversations |
 
@@ -143,6 +144,7 @@ When `allConversations: true` is set, `lcm_expand_query` can synthesize one answ
 - `totalSourceTokens` — Total tokens read from the DAG
 - `truncated` — Whether source expansion was truncated or any selected conversation was skipped or failed
 - `conversationBreakdown` — Optional per-conversation success/failure diagnostics for bounded multi-conversation runs
+- `mode` — The effective normal or forensic recall policy, including validation and failure results
 
 Successful single-conversation results keep the response shape above. When delegated recall fails, the result keeps the human-readable `error` and adds `errorCode`, empty source counters, and a `conversationBreakdown`. Failed entries identify the conversation, attempted summary IDs, failure phase, elapsed time, and error code. Timed-out child work is cancelled through the host-owned temporary-session cleanup path. Completed conversation buckets still contribute evidence when another bucket times out; timed-out buckets do not contribute guessed answer text or citations.
 
@@ -152,15 +154,13 @@ Successful single-conversation results keep the response shape above. When deleg
 # Find and expand summaries about a topic
 lcm_expand_query(
   query: "OAuth authentication fix",
-  prompt: "What was the root cause and what commits fixed it?",
-  timeoutMs: 150000
+  prompt: "What was the root cause and what commits fixed it?"
 )
 
 # Expand specific summaries you already have
 lcm_expand_query(
   summaryIds: ["sum_abc123", "sum_def456"],
-  prompt: "What were the exact file changes?",
-  timeoutMs: 150000
+  prompt: "What were the exact file changes?"
 )
 
 # Cross-conversation synthesis
@@ -168,6 +168,7 @@ lcm_expand_query(
   query: "deployment procedure",
   prompt: "What's the current deployment process?",
   allConversations: true,
+  mode: "forensic",
   timeoutMs: 150000
 )
 ```
@@ -190,7 +191,7 @@ Add instructions to your agent's system prompt so it knows when to use LCM tools
 Use LCM tools for recall:
 1. `lcm_grep` — Search all conversations by keyword/regex. Prefer `mode: "full_text"` for short topic terms, use `mode: "regex"` for alternation or other regex syntax, quote exact phrases, use `sort: "relevance"` for older-topic lookups, and `sort: "hybrid"` when recency should still matter.
 2. `lcm_describe` — Inspect a specific summary (cheap, no sub-agent)
-3. `lcm_expand_query` — Deep recall with bounded sub-agent expansion
+3. `lcm_expand_query` — Last-resort deep recall with bounded sub-agent expansion
 
 When summaries in context have an "Expand for details about:" footer
 listing something you need, use `lcm_expand_query` to get the full detail.
@@ -198,12 +199,12 @@ listing something you need, use `lcm_expand_query` to get the full detail.
 
 ### Conversation scoping
 
-By default, tools operate on the current session family: the active conversation plus archived segments that share the same stable session identity. This keeps recall continuous across session rotation and `/reset` replacement rows without widening the search to unrelated sessions. Use `lcm_grep(..., allConversations: true)` when you need broad global discovery. Use `lcm_expand_query(..., allConversations: true)` when you want bounded synthesis across sessions. Use `conversationId` when you already know the exact physical conversation to inspect or expand.
+By default, tools operate on the current session family: the active conversation plus archived segments that share the same stable session identity. This keeps recall continuous across session rotation and `/reset` replacement rows without widening the search to unrelated sessions. Use `lcm_grep(..., allConversations: true)` when you need broad global discovery. Use `lcm_expand_query(..., allConversations: true, mode: "forensic")` when you want bounded synthesis across sessions. Use `conversationId` when you already know the exact physical conversation to inspect or expand.
 
 ### Performance considerations
 
 - `lcm_grep` and `lcm_describe` are fast (direct database queries)
-- `lcm_expand_query` spawns a sub-agent and takes ~30–120 seconds
-- The sub-agent has a 120-second timeout with cleanup guarantees by default, and the tool schema advertises a 150-second OpenClaw dynamic RPC timeout so the host watchdog stays open long enough for delegated recall plus result cleanup
+- Normal `lcm_expand_query` spawns a sub-agent with 30 seconds of work and 5 seconds of cleanup/RPC headroom. Its child prompt limits inspection to two seed summaries and two high-signal expansions, returning `truncated: true` rather than continuing.
+- `mode: "forensic"` retains the 120-second timeout with 30 seconds of cleanup/RPC headroom for explicit deeper investigations.
 - Token caps (`LCM_MAX_EXPAND_TOKENS`) prevent runaway expansion
 - Cross-conversation `lcm_expand_query` expands only a bounded set of top-ranked conversations

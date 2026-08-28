@@ -85,6 +85,14 @@
       "label": "Stub Large Tool Payloads",
       "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
     },
+    "rawUserPayloadMode": {
+      "label": "Raw User Payload Mode",
+      "help": "externalize-large eagerly externalizes oversized user payloads. inline keeps authored payloads exact until real assembly overflow."
+    },
+    "toolResultPayloadMode": {
+      "label": "Tool Result Payload Mode",
+      "help": "externalize-large eagerly externalizes oversized tool results. inline keeps results exact until real assembly overflow."
+    },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization (default 20000)"
@@ -193,9 +201,13 @@
       "label": "Expansion Provider",
       "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
     },
+    "normalDelegationTimeoutMs": {
+      "label": "Normal Recall Timeout (ms)",
+      "help": "Normal lcm_expand_query work budget. Capped at 30000ms so the tool keeps 5000ms for cancellation, cleanup, and result delivery."
+    },
     "delegationTimeoutMs": {
       "label": "Delegation Timeout (ms)",
-      "help": "Wall-clock budget shared by delegated work in one lcm_expand_query call; the tool keeps 30 seconds of RPC headroom for cancellation and cleanup"
+      "help": "Wall-clock work budget for explicit forensic lcm_expand_query calls; the tool keeps 30 seconds of RPC headroom for cancellation and cleanup"
     },
     "summaryTimeoutMs": {
       "label": "Summary Timeout (ms)",
@@ -432,6 +444,14 @@
       "stubLargeToolPayloads": {
         "type": "boolean"
       },
+      "rawUserPayloadMode": {
+        "type": "string",
+        "enum": ["externalize-large", "inline"]
+      },
+      "toolResultPayloadMode": {
+        "type": "string",
+        "enum": ["externalize-large", "inline"]
+      },
       "leafChunkTokens": {
         "type": "integer",
         "minimum": 1
@@ -527,6 +547,11 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "normalDelegationTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 30000
       },
       "delegationTimeoutMs": {
         "type": "integer",

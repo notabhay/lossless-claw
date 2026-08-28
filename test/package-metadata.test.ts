@@ -3,14 +3,18 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 
-const requiredOpenClawVersion = "2026.7.2-beta.2";
+const requiredOpenClawVersion = "2026.7.1";
+const nativeProjectionOpenClawVersion = "2026.7.2-beta.2";
 
 describe("package OpenClaw compatibility metadata", () => {
-  it("declares the SQLite transcript runtime minimum OpenClaw version without an upper bound", () => {
+  it("declares the JSONL-compatible minimum OpenClaw version without an upper bound", () => {
     expect(packageJson.peerDependencies.openclaw).toBe(`>=${requiredOpenClawVersion}`);
     expect(packageJson.openclaw.compat.pluginApi).toBe(`>=${requiredOpenClawVersion}`);
     expect(packageJson.openclaw.compat.minGatewayVersion).toBe(requiredOpenClawVersion);
-    expect(packageJson.openclaw.compat.tested).toEqual([requiredOpenClawVersion]);
+    expect(packageJson.openclaw.compat.tested).toEqual([
+      requiredOpenClawVersion,
+      nativeProjectionOpenClawVersion,
+    ]);
     expect(packageJson.openclaw.build.openclawVersion).toBe(requiredOpenClawVersion);
   });
 

@@ -7,6 +7,7 @@ type StartupBannerKey =
   | "retired-auto-rotate-session-files-config"
   | "ignore-session-patterns"
   | "stateless-session-patterns"
+  | "transcript-projection-source"
   | "ignore-session-patterns-env-override"
   | "stateless-session-patterns-env-override"
   | "host-fallback-capture-only"

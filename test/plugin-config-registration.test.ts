@@ -356,7 +356,7 @@ describe("lcm plugin registration", () => {
     delete (api as unknown as { registerContextEngine?: unknown }).registerContextEngine;
 
     expect(() => lcmPlugin.register(api)).toThrow(
-      /requires OpenClaw >=2026\.7\.2-beta\.2 with api\.registerContextEngine/,
+      /requires OpenClaw >=2026\.7\.1 with api\.registerContextEngine/,
     );
     expect(createSpy).not.toHaveBeenCalled();
     expect(api.registerCommand).not.toHaveBeenCalled();
@@ -925,6 +925,69 @@ describe("lcm plugin registration", () => {
         },
       },
     } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("Runtime LLM model override policy"),
+    );
+  });
+
+  it("warns when configured default or compaction candidates lack runtime LLM policy", () => {
+    const { api, warnLog } = buildApi(
+      { enabled: true },
+      {
+        runtimeConfig: {
+          ...compactionAndDefaultModelConfig({
+            compactionModel: "openai/gpt-5.6-sol",
+            defaultModel: "openai/gpt-6-astra",
+          }),
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+                llm: {
+                  allowModelOverride: true,
+                  allowedModels: ["openai/gpt-6-astra"],
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("agents.defaults.compaction.model=openai/gpt-5.6-sol"),
+    );
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("agents.defaults.model=openai/gpt-6-astra"),
+    );
+  });
+
+  it("does not warn when default and compaction candidates are allowlisted", () => {
+    const runtimeConfig = {
+      ...compactionAndDefaultModelConfig({
+        compactionModel: "openai/gpt-5.6-sol",
+        defaultModel: "openai/gpt-6-astra",
+      }),
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            enabled: true,
+            llm: {
+              allowModelOverride: true,
+              allowedModels: ["openai/gpt-6-astra", "openai/gpt-5.6-sol"],
+            },
+          },
+        },
+      },
+    };
+    const { api, warnLog } = buildApi({ enabled: true }, { runtimeConfig });
+    api.config = {} as OpenClawPluginApi["config"];
 
     lcmPlugin.register(api);
 

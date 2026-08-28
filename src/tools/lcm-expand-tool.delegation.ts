@@ -462,6 +462,7 @@ export async function runDelegatedExpansionLoop(params: {
     sessionKey: params.requesterSessionKey,
     expansionDepth: recursionCheck.expansionDepth,
     originSessionKey: recursionCheck.originSessionKey,
+    mode: "legacy",
   });
   if (recursionCheck.blocked) {
     recordExpansionDelegationTelemetry({
@@ -472,6 +473,7 @@ export async function runDelegatedExpansionLoop(params: {
       sessionKey: params.requesterSessionKey,
       expansionDepth: recursionCheck.expansionDepth,
       originSessionKey: recursionCheck.originSessionKey,
+      mode: "legacy",
       reason: recursionCheck.reason,
     });
     return {
@@ -522,6 +524,7 @@ export async function runDelegatedExpansionLoop(params: {
           expansionDepth: recursionCheck.expansionDepth,
           originSessionKey: recursionCheck.originSessionKey,
           runId: result.runId,
+          mode: "legacy",
         });
       }
       const okPasses = passes.filter((entry) => entry.status === "ok");
@@ -562,6 +565,7 @@ export async function runDelegatedExpansionLoop(params: {
     sessionKey: params.requesterSessionKey,
     expansionDepth: recursionCheck.expansionDepth,
     originSessionKey: recursionCheck.originSessionKey,
+    mode: "legacy",
   });
   return {
     status: "ok",

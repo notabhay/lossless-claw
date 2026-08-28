@@ -54,7 +54,7 @@ When compaction creates a summary from a range of messages (or summaries), the s
 
 When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
-1. **bootstrap** — On session start, imports the host-provided visible transcript projection into the LCM database. On current SQLite hosts this is keyed by the runtime session target instead of Lossless resolving an active transcript file.
+1. **bootstrap** — On session start, imports the host-provided visible transcript projection into the LCM database. On current SQLite hosts this is keyed by the runtime session target instead of Lossless resolving an active transcript file. On OpenClaw `2026.7.1` JSONL hosts the same projection is rebuilt inside the plugin from the host's raw transcript events (`src/host-compat/`), using the host's own transcript-tree branch selection.
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
 3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
@@ -226,7 +226,7 @@ All mutating operations (ingest, compact) are serialized per-session using a pro
 
 LCM needs model inference for summarization, but it does not resolve provider credentials, base URLs, or provider transport settings directly. Summarization calls go through OpenClaw's `runtime.llm.complete` capability, which owns model preparation, credential resolution, OAuth refresh, provider dispatch, and usage attribution.
 
-Configured Lossless summary model overrides (`summaryModel`, `largeFileSummaryModel`, and `fallbackProviders`) are sent as runtime LLM model override requests. OpenClaw enforces those requests with `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`; denied overrides fail closed instead of silently falling back to a different model.
+Every resolved summary candidate, including configured Lossless models, OpenClaw defaults, and runtime/session hints, is sent as an explicit runtime LLM model request. The requested reasoning budget is forwarded to the host, which normalizes it for that model. Provider errors and aborted completions remain failures. OpenClaw enforces those requests with `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`; denied overrides fail closed instead of silently falling back to a different model.
 
 ## Stable event identity
 

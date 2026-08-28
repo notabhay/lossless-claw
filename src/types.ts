@@ -125,6 +125,8 @@ export type SessionTranscriptReadTarget = {
   agentId?: string;
   storePath?: string;
   threadId?: string | number;
+  /** Exact active transcript file when a JSONL host provides one. */
+  sessionFile?: string;
 };
 
 /** Branch-safe visible message projection returned by OpenClaw's transcript runtime. */

@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { DEFAULT_NORMAL_DELEGATION_TIMEOUT_MS } from "../db/config.js";
 import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
 import { jsonResult, type AnyAgentTool } from "./common.js";
@@ -14,6 +15,9 @@ import {
 import {
   allocateExpansionTokenCaps,
   createExpansionDeadline,
+  NORMAL_DYNAMIC_TOOL_TIMEOUT_MS,
+  remainingDeadlineMs,
+  type ExpandQueryMode,
 } from "./lcm-expansion-deadline.js";
 import {
   normalizeSummaryIds,
@@ -30,6 +34,7 @@ import {
 
 const DEFAULT_DELEGATED_WAIT_TIMEOUT_MS = 120_000;
 const DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS = 30_000;
+const NORMAL_DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS = 5_000;
 const MAX_DYNAMIC_TOOL_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_ANSWER_TOKENS = 2_000;
 const DEFAULT_MAX_CONVERSATION_BUCKETS = 3;
@@ -42,7 +47,7 @@ function resolveAdvertisedDynamicToolTimeoutMs(delegatedWaitTimeoutMs: number): 
   return clampPositiveTimeoutMs(delegatedWaitTimeoutMs + DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS);
 }
 
-function createLcmExpandQuerySchema(dynamicToolTimeoutMs: number) {
+function createLcmExpandQuerySchema() {
   return Type.Object({
     summaryIds: Type.Optional(
       Type.Array(Type.String(), {
@@ -84,12 +89,20 @@ function createLcmExpandQuerySchema(dynamicToolTimeoutMs: number) {
         minimum: 1,
       }),
     ),
-    timeoutMs: Type.Number({
-      description:
-        "Total OpenClaw dynamic tool RPC timeout in milliseconds. Use the default value unless the user asks for a shorter recall attempt; this keeps delegated recall open before the host watchdog fires.",
-      default: dynamicToolTimeoutMs,
-      minimum: 1,
-    }),
+    mode: Type.Optional(
+      Type.Union([Type.Literal("normal"), Type.Literal("forensic")], {
+        description:
+          "normal is the bounded live-chat recall pass. forensic opts into the longer legacy deep-recall budget.",
+        default: "normal",
+      }),
+    ),
+    timeoutMs: Type.Optional(
+      Type.Number({
+        description:
+          "Total OpenClaw dynamic tool RPC timeout in milliseconds. Omit it to use the mode-specific runtime default: 35000ms for normal or the configured forensic budget plus cleanup headroom for forensic.",
+        minimum: 1,
+      }),
+    ),
   });
 }
 
@@ -105,6 +118,7 @@ type ConversationBreakdown = {
   phase?: DelegatedFailurePhase;
   elapsedMs?: number;
   errorCode?: DelegatedFailureCode;
+  mode: ExpandQueryMode;
 };
 
 type ExpandQueryReply = {
@@ -116,6 +130,7 @@ type ExpandQueryReply = {
   truncated: boolean;
   conversationBreakdown?: ConversationBreakdown[];
   sourceConversationId?: number;
+  mode: ExpandQueryMode;
 };
 
 type SummaryCandidate = {
@@ -145,6 +160,7 @@ type BucketExecutionResult =
       candidateCount: number;
       summaryIds: string[];
       error: string;
+      mode: ExpandQueryMode;
     };
 
 function maxDate(left?: Date, right?: Date): Date | undefined {
@@ -246,6 +262,7 @@ function buildExpandQueryReply(params: {
   totalSourceTokens: number;
   truncated: boolean;
   conversationBreakdown?: ConversationBreakdown[];
+  mode: ExpandQueryMode;
 }): ExpandQueryReply {
   const sourceConversationIds = [...params.sourceConversationIds].sort((left, right) => left - right);
 
@@ -259,6 +276,7 @@ function buildExpandQueryReply(params: {
     expandedSummaryCount: params.expandedSummaryCount,
     totalSourceTokens: params.totalSourceTokens,
     truncated: params.truncated,
+    mode: params.mode,
     ...(params.conversationBreakdown ? { conversationBreakdown: params.conversationBreakdown } : {}),
   };
 }
@@ -274,6 +292,7 @@ function buildConversationBreakdown(results: BucketExecutionResult[]): Conversat
         totalSourceTokens: result.reply.totalSourceTokens,
         truncated: result.reply.truncated,
         status: "success",
+        mode: result.mode,
       };
     }
     if (result.status === "failed") {
@@ -289,6 +308,7 @@ function buildConversationBreakdown(results: BucketExecutionResult[]): Conversat
         elapsedMs: result.elapsedMs,
         errorCode: result.code,
         error: result.error,
+        mode: result.mode,
       };
     }
     return {
@@ -298,13 +318,14 @@ function buildConversationBreakdown(results: BucketExecutionResult[]): Conversat
       totalSourceTokens: 0,
       truncated: true,
       status: "skipped",
+      mode: result.mode,
       error: result.error,
     };
   });
 }
 
 /** Preserve the legacy error text while adding structured failure accounting. */
-function buildDelegatedFailureReply(results: BucketExecutionResult[]) {
+function buildDelegatedFailureReply(results: BucketExecutionResult[], mode: ExpandQueryMode) {
   const firstFailure = results.find(
     (result): result is Extract<BucketExecutionResult, { status: "failed" }> =>
       result.status === "failed",
@@ -319,7 +340,36 @@ function buildDelegatedFailureReply(results: BucketExecutionResult[]) {
     expandedSummaryCount: 0,
     totalSourceTokens: 0,
     conversationBreakdown: buildConversationBreakdown(results),
+    mode,
   };
+}
+
+function discoveryDeadlineError(): Error {
+  return new Error("lcm_expand_query timed out during discovery before delegated expansion.");
+}
+
+/** Keep scope and candidate discovery inside the same absolute work deadline as child work. */
+async function awaitExpansionDiscovery<T>(params: {
+  operation: Promise<T>;
+  deadline: ReturnType<typeof createExpansionDeadline>;
+}): Promise<T> {
+  const remainingMs = remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now());
+  if (remainingMs <= 0) {
+    throw discoveryDeadlineError();
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      params.operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(discoveryDeadlineError()), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function synthesizeConversationAnswers(params: {
@@ -608,7 +658,8 @@ export function createLcmExpandQueryTool(input: {
 }): AnyAgentTool {
   const configuredDelegatedWaitTimeoutMs =
     input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
-  const advertisedDynamicToolTimeoutMs = resolveAdvertisedDynamicToolTimeoutMs(
+  const configuredNormalDelegatedWaitTimeoutMs = input.deps.config.normalDelegationTimeoutMs;
+  const advertisedForensicDynamicToolTimeoutMs = resolveAdvertisedDynamicToolTimeoutMs(
     configuredDelegatedWaitTimeoutMs,
   );
 
@@ -619,17 +670,14 @@ export function createLcmExpandQueryTool(input: {
       "Answer a focused natural-language question using delegated LCM expansion. " +
       "Find candidate summaries (by IDs or a short FTS5 query that follows the same full-text rules as lcm_grep), expand them in a delegated sub-agent, " +
       "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
-    parameters: createLcmExpandQuerySchema(advertisedDynamicToolTimeoutMs),
+    parameters: createLcmExpandQuerySchema(),
     async execute(_toolCallId, params) {
       const requestStartedAtMs = performance.now();
-      const lcm = input.lcm ?? (await input.getLcm?.());
-      if (!lcm) {
-        throw new Error("LCM engine is unavailable.");
-      }
       const p = params as Record<string, unknown>;
       const explicitSummaryIds = normalizeSummaryIds(p.summaryIds as string[] | undefined);
       const query = typeof p.query === "string" ? p.query.trim() : "";
       const prompt = typeof p.prompt === "string" ? p.prompt.trim() : "";
+      const mode: ExpandQueryMode = p.mode === "forensic" ? "forensic" : "normal";
       const requestedMaxTokens =
         typeof p.maxTokens === "number" ? Math.trunc(p.maxTokens) : undefined;
       const maxTokens =
@@ -646,11 +694,24 @@ export function createLcmExpandQueryTool(input: {
         typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs)
           ? clampPositiveTimeoutMs(p.timeoutMs)
           : undefined;
+      const configuredModeDelegationTimeoutMs =
+        mode === "normal"
+          ? configuredNormalDelegatedWaitTimeoutMs || DEFAULT_NORMAL_DELEGATION_TIMEOUT_MS
+          : configuredDelegatedWaitTimeoutMs;
+      const modeHeadroomMs =
+        mode === "normal"
+          ? NORMAL_DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS
+          : DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS;
+      const defaultDynamicToolTimeoutMs =
+        mode === "normal"
+          ? NORMAL_DYNAMIC_TOOL_TIMEOUT_MS
+          : advertisedForensicDynamicToolTimeoutMs;
       const deadline = createExpansionDeadline({
         nowMs: requestStartedAtMs,
-        dynamicToolTimeoutMs: requestedDynamicToolTimeoutMs ?? advertisedDynamicToolTimeoutMs,
-        delegationTimeoutMs: configuredDelegatedWaitTimeoutMs,
-        headroomMs: DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS,
+        dynamicToolTimeoutMs: requestedDynamicToolTimeoutMs ?? defaultDynamicToolTimeoutMs,
+        delegationTimeoutMs: configuredModeDelegationTimeoutMs,
+        headroomMs: modeHeadroomMs,
+        mode,
       });
       const delegatedWaitTimeoutMs = Math.max(
         1,
@@ -661,13 +722,45 @@ export function createLcmExpandQueryTool(input: {
       if (!prompt) {
         return jsonResult({
           error: "prompt is required.",
+          mode,
         });
       }
 
       if (explicitSummaryIds.length === 0 && !query) {
         return jsonResult({
           error: "Either summaryIds or query must be provided.",
+          mode,
         });
+      }
+
+      const hasExplicitConversationId =
+        typeof p.conversationId === "number" && Number.isFinite(p.conversationId);
+      if (mode === "normal" && p.allConversations === true && !hasExplicitConversationId) {
+        return jsonResult({
+          error: 'Cross-conversation lcm_expand_query requires mode: "forensic".',
+          mode,
+        });
+      }
+
+      let lcm: LcmContextEngine | undefined;
+      try {
+        lcm = input.lcm ?? (input.getLcm ? await awaitExpansionDiscovery({
+          operation: input.getLcm(),
+          deadline,
+        }) : undefined);
+      } catch (error) {
+        if (error instanceof Error && error.message === discoveryDeadlineError().message) {
+          return jsonResult({
+            errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+            error: error.message,
+            truncated: true,
+            mode,
+          });
+        }
+        return jsonResult({ error: formatExpansionFailure(error), mode });
+      }
+      if (!lcm) {
+        return jsonResult({ error: "LCM engine is unavailable.", mode });
       }
 
       const callerSessionKey =
@@ -688,6 +781,7 @@ export function createLcmExpandQueryTool(input: {
         sessionKey: callerSessionKey,
         expansionDepth: recursionCheck.expansionDepth,
         originSessionKey: recursionCheck.originSessionKey,
+        mode,
       });
       if (recursionCheck.blocked) {
         recordExpansionDelegationTelemetry({
@@ -698,6 +792,7 @@ export function createLcmExpandQueryTool(input: {
           sessionKey: callerSessionKey,
           expansionDepth: recursionCheck.expansionDepth,
           originSessionKey: recursionCheck.originSessionKey,
+          mode,
           reason: recursionCheck.reason,
         });
         return jsonResult({
@@ -707,21 +802,25 @@ export function createLcmExpandQueryTool(input: {
           expansionDepth: recursionCheck.expansionDepth,
           originSessionKey: recursionCheck.originSessionKey,
           reason: recursionCheck.reason,
+          mode,
         });
       }
 
       const originSessionKey = recursionCheck.originSessionKey || callerSessionKey || "main";
 
       try {
-        const conversationScope = await resolveLcmConversationScope({
-          lcm,
-          deps: input.deps,
-          sessionId: input.sessionId,
-          sessionKey: input.sessionKey,
-          params: p,
+        const conversationScope = await awaitExpansionDiscovery({
+          operation: resolveLcmConversationScope({
+            lcm,
+            deps: input.deps,
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+            params: p,
+          }),
+          deadline,
         });
         if (conversationScope.error) {
-          return jsonResult({ error: conversationScope.error });
+          return jsonResult({ error: conversationScope.error, mode });
         }
         const familyScopedConversationId =
           (conversationScope.conversationIds?.length ?? 0) > 1
@@ -734,9 +833,12 @@ export function createLcmExpandQueryTool(input: {
           (conversationScope.conversationIds?.length ?? 0) <= 1 &&
           callerSessionKey
         ) {
-          scopedConversationId = await resolveRequesterConversationScopeId({
-            requesterSessionKey: callerSessionKey,
-            lcm,
+          scopedConversationId = await awaitExpansionDiscovery({
+            operation: resolveRequesterConversationScopeId({
+              requesterSessionKey: callerSessionKey,
+              lcm,
+            }),
+            deadline,
           });
         }
 
@@ -748,21 +850,26 @@ export function createLcmExpandQueryTool(input: {
           return jsonResult({
             error:
               "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
+            mode,
           });
         }
 
-        const candidates = await resolveSummaryCandidates({
-          lcm,
-          explicitSummaryIds,
-          query: query || undefined,
-          conversationId: scopedConversationId,
-          conversationIds: conversationScope.conversationIds,
+        const candidates = await awaitExpansionDiscovery({
+          operation: resolveSummaryCandidates({
+            lcm,
+            explicitSummaryIds,
+            query: query || undefined,
+            conversationId: scopedConversationId,
+            conversationIds: conversationScope.conversationIds,
+          }),
+          deadline,
         });
 
         if (candidates.length === 0) {
           if (typeof scopedConversationId !== "number") {
             return jsonResult({
               error: "No matching summaries found.",
+              mode,
             });
           }
           return jsonResult(
@@ -773,6 +880,7 @@ export function createLcmExpandQueryTool(input: {
               expandedSummaryCount: 0,
               totalSourceTokens: 0,
               truncated: false,
+              mode,
             }),
           );
         }
@@ -792,6 +900,7 @@ export function createLcmExpandQueryTool(input: {
             sessionKey: callerSessionKey,
             expansionDepth: recursionCheck.expansionDepth,
             originSessionKey: concurrencyCheck.originSessionKey,
+            mode,
             reason: concurrencyCheck.reason,
           });
           return jsonResult({
@@ -801,6 +910,7 @@ export function createLcmExpandQueryTool(input: {
             expansionDepth: recursionCheck.expansionDepth,
             originSessionKey: concurrencyCheck.originSessionKey,
             reason: concurrencyCheck.reason,
+            mode,
           });
         }
 
@@ -834,12 +944,14 @@ export function createLcmExpandQueryTool(input: {
             originSessionKey,
             deadline,
             delegatedWaitTimeoutSeconds,
+            mode,
           });
           if (delegatedOutcome.status === "failed") {
             return jsonResult(
-              buildDelegatedFailureReply([
-                { ...delegatedOutcome, candidateCount: bucket.candidateCount },
-              ]),
+              buildDelegatedFailureReply(
+                [{ ...delegatedOutcome, candidateCount: bucket.candidateCount }],
+                mode,
+              ),
             );
           }
           const delegatedReply = delegatedOutcome.reply;
@@ -852,6 +964,7 @@ export function createLcmExpandQueryTool(input: {
               expandedSummaryCount: delegatedReply.expandedSummaryCount,
               totalSourceTokens: delegatedReply.totalSourceTokens,
               truncated: delegatedReply.truncated,
+              mode,
             }),
           );
         }
@@ -882,6 +995,7 @@ export function createLcmExpandQueryTool(input: {
               originSessionKey,
               deadline,
               delegatedWaitTimeoutSeconds,
+              mode,
             }),
           ),
         );
@@ -899,6 +1013,7 @@ export function createLcmExpandQueryTool(input: {
             summaryIds: bucket.summaryIds,
             candidateCount: bucket.candidateCount,
             error: "global token budget exhausted",
+            mode,
           });
         }
         for (const bucket of limitSkippedBuckets) {
@@ -908,6 +1023,7 @@ export function createLcmExpandQueryTool(input: {
             summaryIds: bucket.summaryIds,
             candidateCount: bucket.candidateCount,
             error: `skipped after reaching max conversation bucket limit (${DEFAULT_MAX_CONVERSATION_BUCKETS})`,
+            mode,
           });
         }
 
@@ -916,7 +1032,7 @@ export function createLcmExpandQueryTool(input: {
             result.status === "success",
         );
         if (successfulResults.length === 0) {
-          return jsonResult(buildDelegatedFailureReply(bucketResults));
+          return jsonResult(buildDelegatedFailureReply(bucketResults, mode));
         }
 
         return jsonResult(
@@ -939,13 +1055,17 @@ export function createLcmExpandQueryTool(input: {
               successfulResults.some((result) => result.reply.truncated)
               || bucketResults.some((result) => result.status !== "success"),
             conversationBreakdown: buildConversationBreakdown(bucketResults),
+            mode,
           }),
         );
       } catch (error) {
         const failure = formatExpansionFailure(error);
+        const timedOut = failure === discoveryDeadlineError().message;
         input.deps.log.error(`[lcm] delegated expansion query failed: ${failure}`);
         return jsonResult({
+          ...(timedOut ? { errorCode: "DELEGATED_EXPANSION_TIMEOUT", truncated: true } : {}),
           error: failure,
+          mode,
         });
       } finally {
         releaseExpansionConcurrencySlot({

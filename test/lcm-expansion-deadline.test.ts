@@ -6,6 +6,46 @@ import {
 } from "../src/tools/lcm-expansion-deadline.js";
 
 describe("createExpansionDeadline", () => {
+  it("gives normal recall 30 seconds of work and five seconds of cleanup headroom", () => {
+    expect(
+      createExpansionDeadline({
+        nowMs: 1_000,
+        dynamicToolTimeoutMs: 35_000,
+        delegationTimeoutMs: 30_000,
+        headroomMs: 5_000,
+        mode: "normal",
+      }),
+    ).toEqual({
+      startedAtMs: 1_000,
+      totalDeadlineMs: 36_000,
+      workDeadlineMs: 31_000,
+    });
+    const deadline = createExpansionDeadline({
+      nowMs: 1_000,
+      dynamicToolTimeoutMs: 35_000,
+      delegationTimeoutMs: 30_000,
+      headroomMs: 5_000,
+      mode: "normal",
+    });
+    expect(deadline.totalDeadlineMs - deadline.startedAtMs).toBe(35_000);
+  });
+
+  it("never lets normal recall exceed its 35-second total budget", () => {
+    expect(
+      createExpansionDeadline({
+        nowMs: 1_000,
+        dynamicToolTimeoutMs: 120_000,
+        delegationTimeoutMs: 120_000,
+        headroomMs: 5_000,
+        mode: "normal",
+      }),
+    ).toEqual({
+      startedAtMs: 1_000,
+      totalDeadlineMs: 36_000,
+      workDeadlineMs: 31_000,
+    });
+  });
+
   it("keeps the default delegated work window and cleanup reserve", () => {
     expect(
       createExpansionDeadline({
@@ -13,6 +53,7 @@ describe("createExpansionDeadline", () => {
         dynamicToolTimeoutMs: 150_000,
         delegationTimeoutMs: 120_000,
         headroomMs: 30_000,
+        mode: "forensic",
       }),
     ).toEqual({
       startedAtMs: 1_000,
@@ -28,6 +69,7 @@ describe("createExpansionDeadline", () => {
         dynamicToolTimeoutMs: 600_000,
         delegationTimeoutMs: 180_000,
         headroomMs: 30_000,
+        mode: "forensic",
       }).workDeadlineMs,
     ).toBe(180_500);
   });
@@ -39,6 +81,7 @@ describe("createExpansionDeadline", () => {
         dynamicToolTimeoutMs: 20_000,
         delegationTimeoutMs: 120_000,
         headroomMs: 30_000,
+        mode: "forensic",
       }),
     ).toEqual({
       startedAtMs: 2_000,

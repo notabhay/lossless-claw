@@ -27,6 +27,8 @@ export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
 export const DEFAULT_SUMMARY_CALL_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW = 24;
 export const DEFAULT_SUMMARY_SPEND_BACKOFF_MS = 30 * 60 * 1000;
+export const DEFAULT_NORMAL_DELEGATION_TIMEOUT_MS = 30_000;
+export const MAX_NORMAL_DELEGATION_TIMEOUT_MS = 30_000;
 
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
@@ -70,6 +72,7 @@ export type ContextThresholdOverride = {
 };
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
+export type PayloadMode = "externalize-large" | "inline";
 
 export type LcmConfigDiagnostics = {
   ignoreSessionPatternsSource: LcmConfigSource;
@@ -114,6 +117,10 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /** Keep authored user payloads inline until assembly genuinely exceeds its budget. */
+  rawUserPayloadMode: PayloadMode;
+  /** Keep tool results inline until assembly genuinely exceeds its budget. */
+  toolResultPayloadMode: PayloadMode;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -149,6 +156,8 @@ export type LcmConfig = {
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
   expansionModel: string;
+  /** Max delegated work time for normal live-chat lcm_expand_query calls. */
+  normalDelegationTimeoutMs: number;
   /** Max time to wait for delegated lcm_expand_query sub-agent completion. */
   delegationTimeoutMs: number;
   /** Max time to wait for a single model-backed LCM summarizer call. */
@@ -320,6 +329,14 @@ function toProactiveThresholdCompactionMode(
 ): ProactiveThresholdCompactionMode | undefined {
   const normalized = toStr(value)?.toLowerCase();
   if (normalized === "inline" || normalized === "deferred") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function toPayloadMode(value: unknown): PayloadMode | undefined {
+  const normalized = toStr(value)?.toLowerCase();
+  if (normalized === "externalize-large" || normalized === "inline") {
     return normalized;
   }
   return undefined;
@@ -606,6 +623,10 @@ export function resolveLcmConfigWithDiagnostics(
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
       : undefined;
+  const envNormalDelegationTimeoutMs =
+    env.LCM_NORMAL_DELEGATION_TIMEOUT_MS !== undefined
+      ? toNumber(env.LCM_NORMAL_DELEGATION_TIMEOUT_MS)
+      : undefined;
   const resolvedDynamicLeafChunkMax = Math.max(
     resolvedLeafChunkTokens,
     parseFiniteInt(env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX)
@@ -703,6 +724,14 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      rawUserPayloadMode:
+        toPayloadMode(env.LCM_RAW_USER_PAYLOAD_MODE)
+          ?? toPayloadMode(pc.rawUserPayloadMode)
+          ?? "externalize-large",
+      toolResultPayloadMode:
+        toPayloadMode(env.LCM_TOOL_RESULT_PAYLOAD_MODE)
+          ?? toPayloadMode(pc.toolResultPayloadMode)
+          ?? "externalize-large",
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,
@@ -749,6 +778,15 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_EXPANSION_PROVIDER?.trim() ?? toStr(pc.expansionProvider) ?? "",
       expansionModel:
         env.LCM_EXPANSION_MODEL?.trim() ?? toStr(pc.expansionModel) ?? "",
+      normalDelegationTimeoutMs: Math.min(
+        MAX_NORMAL_DELEGATION_TIMEOUT_MS,
+        Math.max(
+          1,
+          envNormalDelegationTimeoutMs
+            ?? toNumber(pc.normalDelegationTimeoutMs)
+            ?? DEFAULT_NORMAL_DELEGATION_TIMEOUT_MS,
+        ),
+      ),
       delegationTimeoutMs: envDelegationTimeoutMs ?? toNumber(pc.delegationTimeoutMs) ?? 120000,
       summaryTimeoutMs:
         parseFiniteInt(env.LCM_SUMMARY_TIMEOUT_MS)

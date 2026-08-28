@@ -2,6 +2,8 @@
 // Split from the former monolithic test/engine.test.ts; shared fixtures live in test/helpers.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ContextAssembler } from "../src/assembler.js";
 import { LcmContextEngine } from "../src/engine.js";
@@ -13,10 +15,208 @@ import {
   createEngineWithDepsOverrides,
   createEngineWithConfig,
   makeMessage,
+  tempDirs,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine.assemble canonical path", () => {
+  it("materializes only host-managed typed media once and preserves native image blocks", async () => {
+    const managedRoot = mkdtempSync(join(tmpdir(), "lossless-claw-managed-media-"));
+    const outsideRoot = mkdtempSync(join(tmpdir(), "lossless-claw-unmanaged-media-"));
+    tempDirs.push(managedRoot, outsideRoot);
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = randomUUID();
+    const fixtures = [
+      ["image", "photo.jpg", "image/jpeg", "image.description"],
+      ["audio", "voice.ogg", "audio/ogg", "audio.transcription"],
+      ["video", "clip.mp4", "video/mp4", "video.description"],
+      ["file", "reference.pdf", "application/pdf", "file.extraction"],
+    ] as const;
+    const externalFiles: Array<{
+      marker: string;
+      idempotencyKey: string;
+      mediaRef: string;
+      managedLocalPath: string;
+      fileName: string;
+      mimeType: string;
+      kind: string;
+      sourceMessageId: string;
+      sourceIndex: number;
+      contentHash: string;
+      understanding: Array<{
+        kind: string;
+        text: string;
+        provider: string;
+        model: string;
+        trust: string;
+      }>;
+    }> = fixtures.map(([kind, fileName, mimeType, understandingKind], index) => {
+      const managedLocalPath = join(managedRoot, fileName);
+      writeFileSync(managedLocalPath, `${kind}-bytes`);
+      return {
+        marker: `[[managed-media-${index}]]`,
+        idempotencyKey: `message-1:${index}`,
+        mediaRef: `media:${kind}:${index}`,
+        managedLocalPath,
+        fileName,
+        mimeType,
+        kind,
+        sourceMessageId: "message-1",
+        sourceIndex: index,
+        contentHash: `sha256:${kind}`,
+        understanding: [
+          {
+            kind: understandingKind,
+            text: `${kind} derived output`,
+            provider: "google",
+            model: "gemini-test",
+            trust: "derived_untrusted",
+          },
+        ],
+      };
+    });
+    const unmanagedPath = join(outsideRoot, "unmanaged.txt");
+    writeFileSync(unmanagedPath, "must-not-copy");
+    externalFiles.push({
+      marker: "[[unmanaged-media]]",
+      idempotencyKey: "message-1:4",
+      mediaRef: "media:file:4",
+      managedLocalPath: unmanagedPath,
+      fileName: "unmanaged.txt",
+      mimeType: "text/plain",
+      kind: "file",
+      sourceMessageId: "message-1",
+      sourceIndex: 4,
+      contentHash: "sha256:unmanaged",
+      understanding: [],
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+    const liveMessage = {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: [
+            "[Inter-session message]",
+            "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>",
+            "typed inbound media",
+            "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+            ...externalFiles.map((file) => file.marker),
+          ].join("\n"),
+        },
+        { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+      ],
+    } as AgentMessage;
+    const runtimeContext = { managedMediaRoots: [managedRoot], externalFiles };
+
+    const first = await engine.assemble({
+      sessionId,
+      messages: [liveMessage],
+      tokenBudget: 10_000,
+      runtimeContext,
+    });
+    const rendered = JSON.stringify(first.messages);
+    expect(rendered).toContain("[LCM File: file_");
+    expect(rendered).toContain("[[unmanaged-media]]");
+    expect(rendered).not.toContain("[[managed-media-0]]");
+    expect(rendered).toContain('"type":"image"');
+    expect(rendered).toContain("iVBORw0KGgo=");
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const afterFirst = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(afterFirst).toHaveLength(4);
+    expect(afterFirst.map((file) => file.fileName).sort()).toEqual(
+      fixtures.map(([, fileName]) => fileName).sort(),
+    );
+    for (const file of afterFirst) {
+      expect(readFileSync(file.storageUri, "utf8")).toContain("-bytes");
+      expect(file.explorationSummary).toContain("trust=derived_untrusted");
+      expect(file.explorationSummary).toContain("Source message id: message-1");
+    }
+
+    await engine.assemble({
+      sessionId,
+      messages: [liveMessage],
+      tokenBudget: 10_000,
+      runtimeContext,
+    });
+    const afterSecond = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(afterSecond.map((file) => file.fileId).sort()).toEqual(
+      afterFirst.map((file) => file.fileId).sort(),
+    );
+  });
+
+  it("externalizes inline authored and tool payloads only after real assembly overflow", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 8,
+      largeFileTokenThreshold: 20,
+      rawUserPayloadMode: "inline",
+      toolResultPayloadMode: "inline",
+    });
+    const sessionId = randomUUID();
+    const authored = `${"authored envelope line\n".repeat(240)}done`;
+    const toolOutput = `${"tool output line\n".repeat(240)}done`;
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: authored } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_overflow", name: "read", input: {} }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_overflow",
+        toolName: "read",
+        content: [{ type: "text", text: toolOutput }],
+      } as AgentMessage,
+    });
+
+    const roomy = await engine.assemble({ sessionId, messages: [], tokenBudget: 20_000 });
+    expect(roomy.messages[0]?.content).toBe(authored);
+    expect(JSON.stringify(roomy.messages)).toContain("tool output line");
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await expect(
+      engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId),
+    ).resolves.toHaveLength(0);
+
+    const constrained = await engine.assemble({ sessionId, messages: [], tokenBudget: 400 });
+    const rendered = JSON.stringify(constrained.messages);
+    expect(rendered).toContain("[LCM Raw Payload: file_");
+    expect(rendered).toContain("[LCM Tool Output: file_");
+    const afterFirstOverflow = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(afterFirstOverflow).toHaveLength(2);
+
+    await engine.assemble({ sessionId, messages: [], tokenBudget: 400 });
+    const afterSecondOverflow = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(afterSecondOverflow.map((file) => file.fileId).sort()).toEqual(
+      afterFirstOverflow.map((file) => file.fileId).sort(),
+    );
+  });
+
   it("strips assistant prefill tails when no DB conversation exists", async () => {
     const engine = createEngineWithConfig({ promptAwareEviction: false });
     const liveMessages: AgentMessage[] = [

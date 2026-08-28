@@ -19,6 +19,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import {
   SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+  buildDegradedLiveAssembleResult,
   clampMessagesToSerializedBudget,
 } from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
@@ -142,6 +143,24 @@ describe("bounded assemble output", () => {
     );
     expect(result.evictedMessages).toBeGreaterThan(0);
     expect(result.messages.some((m) => m.role === "user")).toBe(true);
+  });
+
+  it("keeps degraded live fallback below the renderer-headroom target", () => {
+    const messages = makeHeavyLiveTranscript(12, 4_000);
+    const serializedTokens = estimateSerializedMessagesTokens(messages);
+    const tokenBudget = Math.ceil(serializedTokens / 0.95);
+
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages: messages,
+      tokenBudget,
+      contextProjection: { mode: "thread_bootstrap", epoch: "test" },
+    });
+
+    expect(estimateSerializedMessagesTokens(result.messages)).toBeLessThanOrEqual(
+      Math.floor(tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
+    );
+    expect(result.messages.length).toBeLessThan(messages.length);
+    expect(result.messages.some((message) => message.role === "user")).toBe(true);
   });
 
   it("bounds the live fallback when stored coverage trails a heavy live transcript", async () => {

@@ -2,6 +2,8 @@
 
 Use recall tools when the question depends on exact historical evidence from compacted context.
 
+For room history, use the channel archive or omniscience surface first. For same-day state, use the current journal. For older workspace context, use memory search. Lossless recall is for compacted conversation evidence after those cheaper sources cannot settle the question.
+
 ## Tool selection
 
 ### `lcm_grep`
@@ -30,10 +32,10 @@ Do not use it for:
 
 Use for:
 
-- focused questions that need richer detail recovered from summaries
+- focused questions that need richer detail recovered from summaries after grep and describe
 - evidence-oriented follow-up after `lcm_grep` or `lcm_describe`
 
-Cross-conversation expansion runs its selected conversation buckets under one shared deadline and one shared token budget. Completed buckets still return evidence when a sibling bucket times out. Failure results identify the affected conversation, summary IDs, phase, and error code; they never invent answer text for interrupted work.
+Cross-conversation expansion requires explicit `mode: "forensic"` and runs its selected conversation buckets under one shared deadline and one shared token budget. Completed buckets still return evidence when a sibling bucket times out. Failure results identify the affected conversation, summary IDs, phase, and error code; they never invent answer text for interrupted work.
 
 This is the best recall tool when the user asks for:
 
@@ -41,6 +43,8 @@ This is the best recall tool when the user asks for:
 - exact file paths
 - precise timestamps
 - root-cause chains
+
+Default `mode: "normal"` is a 30-second end-to-end work pass with 5 seconds of cleanup/RPC headroom. Its deadline includes LCM initialization, scope resolution, and candidate discovery, and it can create at most one child. It asks that child to inspect no more than two seed summaries and expand no more than two high-signal paths, returning `truncated: true` when the bounded pass is insufficient. Use explicit `mode: "forensic"` for a longer investigation or cross-conversation synthesis. On OpenClaw 2026.7.1 these child-tool limits are prompt restrictions, not a host-enforced tool allowlist.
 
 ### `lcm_expand`
 
@@ -56,7 +60,7 @@ Treat as a specialized sub-agent flow, not the default first step.
 
 When `conversationId` is omitted, recall tools use the current session family: the active conversation plus archived segments that share the same stable session identity. This preserves recall across session rotation and `/reset` replacement rows.
 
-Use `conversationId` only when you need one specific physical conversation. Use `allConversations: true` for broad discovery across unrelated sessions.
+Use `conversationId` only when you need one specific physical conversation. Use `allConversations: true` for broad discovery across unrelated sessions. Cross-conversation `lcm_expand_query` requires explicit `mode: "forensic"`.
 
 ## Important guardrail
 

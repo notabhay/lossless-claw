@@ -124,7 +124,12 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain(
       "If facts seem contradictory or uncertain, verify with lossless-claw recall tools before answering",
     );
-    expect(result.prependSystemContext).toContain("Recall order for compacted conversation history:");
+    expect(result.prependSystemContext).toContain(
+      "Recall order for compacted conversation history after those sources are insufficient:",
+    );
+    expect(result.prependSystemContext).toContain("channel archive or omniscience surface");
+    expect(result.prependSystemContext).toContain("current journal");
+    expect(result.prependSystemContext).toContain("memory search");
     expect(result.prependSystemContext).toContain("1. `lcm_grep` — search by regex or full-text");
     expect(result.prependSystemContext).toContain("`lcm_grep` routing guidance");
     expect(result.prependSystemContext).toContain('Prefer `mode: "full_text"` for keyword or topical recall');
@@ -137,13 +142,13 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain('Use `sort: "hybrid"` when relevance matters but newer context should still get a boost');
     expect(result.prependSystemContext).toContain("2. `lcm_describe` — inspect a specific summary");
     expect(result.prependSystemContext).toContain(
-      "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent",
+      "3. `lcm_expand_query` — last resort for compressed detail.",
     );
     expect(result.prependSystemContext).toContain(
       "`lcm_expand_query` usage",
     );
     expect(result.prependSystemContext).toContain(
-      "lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\", timeoutMs: 150000)",
+      "mode: \"normal\", timeoutMs: 35000",
     );
     expect(result.prependSystemContext).toContain(
       "`query` uses the same FTS5 full-text search path as `lcm_grep`",
@@ -166,7 +171,12 @@ describe("lcm plugin prompt hook", () => {
     );
     expect(result.prependSystemContext).toContain("**Precision flow:**");
     expect(result.prependSystemContext).toContain("1. `lcm_grep` to find the relevant summaries or messages");
-    expect(result.prependSystemContext).toContain("2. `lcm_expand_query` when you need exact evidence before answering");
+    expect(result.prependSystemContext).toContain(
+      "2. `lcm_expand_query(..., mode: \"normal\")` only when grep/describe cannot recover the required evidence",
+    );
+    expect(result.prependSystemContext).toContain("mode: \"forensic\"");
+    expect(result.prependSystemContext).toContain("30 seconds of work plus 5 seconds");
+    expect(result.prependSystemContext).not.toContain("don't ration it");
     expect(result.prependSystemContext).toContain("**Uncertainty checklist:**");
     expect(result.prependSystemContext).toContain("Could compaction have omitted a crucial detail?");
     expect(result.prependSystemContext).toContain(

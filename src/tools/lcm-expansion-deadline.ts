@@ -4,6 +4,10 @@ export type ExpansionDeadline = {
   workDeadlineMs: number;
 };
 
+export type ExpandQueryMode = "normal" | "forensic";
+
+export const NORMAL_DYNAMIC_TOOL_TIMEOUT_MS = 35_000;
+
 /**
  * Derive the total tool deadline and delegated-work deadline from existing
  * caller and plugin timeout budgets.
@@ -13,8 +17,15 @@ export function createExpansionDeadline(params: {
   dynamicToolTimeoutMs: number;
   delegationTimeoutMs: number;
   headroomMs: number;
+  mode: ExpandQueryMode;
 }): ExpansionDeadline {
-  const dynamicToolTimeoutMs = Math.max(1, Math.floor(params.dynamicToolTimeoutMs));
+  const dynamicToolTimeoutMs = Math.max(
+    1,
+    Math.min(
+      params.mode === "normal" ? NORMAL_DYNAMIC_TOOL_TIMEOUT_MS : Number.POSITIVE_INFINITY,
+      Math.floor(params.dynamicToolTimeoutMs),
+    ),
+  );
   const delegationTimeoutMs = Math.max(1, Math.floor(params.delegationTimeoutMs));
   const headroomMs = Math.max(0, Math.floor(params.headroomMs));
   const totalDeadlineMs = params.nowMs + dynamicToolTimeoutMs;

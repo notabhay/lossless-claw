@@ -42,7 +42,7 @@ import {
   type PendingCompactionPublishPolicy,
 } from "./pending-summary-coordinator.js";
 import { readRuntimeModelContext } from "./runtime-model.js";
-import type { LcmConfig } from "./db/config.js";
+import type { LcmConfig, PayloadMode } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
@@ -249,6 +249,32 @@ const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
 /** Stop bypassing compaction backoff after repeated emergency failures. */
 const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
+
+function collectInlineToolResultText(value: unknown, output: string[] = []): string[] {
+  if (typeof value === "string") {
+    output.push(value);
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectInlineToolResultText(item, output);
+    }
+    return output;
+  }
+  if (!value || typeof value !== "object") {
+    return output;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.type === "text" && typeof record.text === "string") {
+    output.push(record.text);
+    return output;
+  }
+  collectInlineToolResultText(record.content, output);
+  collectInlineToolResultText(record.output, output);
+  collectInlineToolResultText(record.result, output);
+  return output;
+}
+
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -367,6 +393,7 @@ function normalizedTargetString(value: unknown): string | undefined {
 function resolveSessionTranscriptReadTarget(params: {
   sessionId: string;
   sessionKey?: string;
+  sessionFile?: string;
   sessionTarget?: ContextEngineSessionTarget;
   runtimeContext?: ContextEngineRuntimeContext;
 }): SessionTranscriptReadTarget | undefined {
@@ -382,12 +409,16 @@ function resolveSessionTranscriptReadTarget(params: {
     typeof target?.threadId === "string" || typeof target?.threadId === "number"
       ? target.threadId
       : undefined;
+  // JSONL hosts hand the exact active transcript file for this run; keep it so
+  // the compat reader does not have to re-derive it from store identity.
+  const sessionFile = normalizedTargetString(params.sessionFile);
   return {
     sessionId,
     sessionKey,
     ...(agentId ? { agentId } : {}),
     ...(storePath ? { storePath } : {}),
     ...(threadId !== undefined ? { threadId } : {}),
+    ...(sessionFile ? { sessionFile } : {}),
   };
 }
 
@@ -401,13 +432,40 @@ function messageFromVisibleTranscriptEntry(
   });
 }
 
+/**
+ * Resolve the stored projection of a message, recovering nested tool-result
+ * text when inline tool payloads are configured. Every consumer that compares
+ * stored content (ingest, anchor audit, image rewrites) must share this so a
+ * recovered tool result never disagrees with itself across code paths.
+ */
+function resolveStoredMessageForIngest(
+  message: AgentMessage,
+  toolResultPayloadMode: PayloadMode,
+): ReturnType<typeof toStoredMessage> {
+  const stored = toStoredMessage(message);
+  if (
+    toolResultPayloadMode !== "inline" ||
+    (message.role !== "tool" && message.role !== "toolResult") ||
+    stored.content.trim().length > 0
+  ) {
+    return stored;
+  }
+  const content = collectInlineToolResultText(
+    (message as unknown as Record<string, unknown>).content,
+  )
+    .filter((text) => text.trim().length > 0)
+    .join("\n");
+  return content ? { ...stored, content, tokenCount: estimateTokens(content) } : stored;
+}
+
 function auditEntryFromVisibleTranscriptEntry(
   entry: VisibleSessionTranscriptMessageEntry,
+  toolResultPayloadMode: PayloadMode,
 ): TranscriptAnchorAuditEntry | null {
   if (!hasPersistableMessageRole(entry.message)) {
     return null;
   }
-  const stored = toStoredMessage(entry.message);
+  const stored = resolveStoredMessageForIngest(entry.message, toolResultPayloadMode);
   return {
     entryId: entry.entryId,
     parentId: entry.parentId,
@@ -2375,11 +2433,11 @@ export class LcmContextEngine implements ContextEngine {
 
     if (compactResult.authFailure && breakerKey) {
       this.compactionGuards.recordCompactionAuthFailure(breakerKey);
-    } else if (compactResult.rounds > 0 && breakerKey) {
+    } else if (compactResult.actionTaken && breakerKey) {
       this.compactionGuards.recordCompactionSuccess(breakerKey);
     }
 
-    const didCompact = compactResult.rounds > 0;
+    const didCompact = compactResult.actionTaken;
     if (didCompact) {
       await this.telemetryRecorder.markLeafCompactionTelemetrySuccess({ conversationId });
     }
@@ -2388,12 +2446,16 @@ export class LcmContextEngine implements ContextEngine {
       ? (didCompact
           ? "provider auth failure after partial compaction"
           : "provider auth failure")
+      : compactResult.notEligible
+        ? didCompact
+          ? "compacted but no eligible context remains above target"
+          : "no eligible context to compact"
       : compactResult.success
         ? didCompact
           ? "compacted"
           : "already under target"
         : "could not reach target";
-    if (!compactResult.success && !compactResult.authFailure) {
+    if (!compactResult.success && !compactResult.authFailure && !compactResult.notEligible) {
       this.compactionGuards.openSummarySpendBackoff({
         scopeKey: summarySpendScopeKey,
         reason: compactUntilReason,
@@ -2407,6 +2469,7 @@ export class LcmContextEngine implements ContextEngine {
       ok: compactResult.success,
       compacted: didCompact,
       reason: compactUntilReason,
+      ...(compactResult.notEligible ? { exhausted: true } : {}),
       result: {
         tokensBefore: decision.currentTokens,
         tokensAfter: compactResult.finalTokens,
@@ -2739,7 +2802,7 @@ export class LcmContextEngine implements ContextEngine {
         : new Set<string>();
     const projectedUserBodyCounts = new Map<string, number>();
     for (const message of params.historicalMessages) {
-      const stored = toStoredMessage(message);
+      const stored = resolveStoredMessageForIngest(message, this.config.toolResultPayloadMode);
       if (stored.role === "user") {
         const body = stripLeadingOpenClawInboundTimestamp(stored.content);
         projectedUserBodyCounts.set(
@@ -2753,7 +2816,7 @@ export class LcmContextEngine implements ContextEngine {
       const message = params.historicalMessages[index]!;
       const entryId = getTranscriptEntryId(message);
       if (entryId && existingEntryIds.has(entryId)) {
-        const stored = toStoredMessage(message);
+        const stored = resolveStoredMessageForIngest(message, this.config.toolResultPayloadMode);
         const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
           params.conversationId,
           entryId,
@@ -2809,7 +2872,7 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
-      const stored = toStoredMessage(message);
+      const stored = resolveStoredMessageForIngest(message, this.config.toolResultPayloadMode);
       if (
         entryId &&
         !establishedEpochBoundary &&
@@ -3013,7 +3076,7 @@ export class LcmContextEngine implements ContextEngine {
       params.conversationId,
     );
     const entries = params.entries
-      .map(auditEntryFromVisibleTranscriptEntry)
+      .map((entry) => auditEntryFromVisibleTranscriptEntry(entry, this.config.toolResultPayloadMode))
       .filter((entry): entry is TranscriptAnchorAuditEntry => entry !== null);
     const audit = classifyTranscriptAnchors({ messages, entries });
     const existingEpoch = await this.conversationStore.getConversationTranscriptEpoch(
@@ -3616,7 +3679,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    let stored = toStoredMessage(message);
+    let stored = resolveStoredMessageForIngest(message, this.config.toolResultPayloadMode);
     if (isOpenClawRuntimeContextLeak(stored)) {
       return { ingested: false };
     }
@@ -3693,7 +3756,7 @@ export class LcmContextEngine implements ContextEngine {
     });
     if (nativeImageIntercepted) {
       messageForParts = nativeImageIntercepted.rewrittenMessage;
-      stored = toStoredMessage(messageForParts);
+      stored = resolveStoredMessageForIngest(messageForParts, this.config.toolResultPayloadMode);
     }
 
     if (stored.role === "tool") {
@@ -3703,7 +3766,7 @@ export class LcmContextEngine implements ContextEngine {
       });
       if (imageIntercepted) {
         messageForParts = imageIntercepted.rewrittenMessage;
-        stored = toStoredMessage(messageForParts);
+        stored = resolveStoredMessageForIngest(messageForParts, this.config.toolResultPayloadMode);
       }
     } else {
       const imageIntercepted = await this.largeFileInterceptor.interceptInlineImages({
@@ -3741,7 +3804,7 @@ export class LcmContextEngine implements ContextEngine {
           } as AgentMessage;
         }
       }
-    } else if (stored.role === "tool") {
+    } else if (stored.role === "tool" && this.config.toolResultPayloadMode !== "inline") {
       const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
         conversationId,
         message: messageForParts,
@@ -3754,11 +3817,16 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const rawPayloadIntercepted = await this.largeFileInterceptor.interceptLargeRawPayload({
-      conversationId,
-      message: messageForParts,
-      stored,
-    });
+    const retainRawPayloadInline =
+      (stored.role === "user" && this.config.rawUserPayloadMode === "inline") ||
+      (stored.role === "tool" && this.config.toolResultPayloadMode === "inline");
+    const rawPayloadIntercepted = retainRawPayloadInline
+      ? null
+      : await this.largeFileInterceptor.interceptLargeRawPayload({
+          conversationId,
+          message: messageForParts,
+          stored,
+        });
     if (rawPayloadIntercepted) {
       messageForParts = rawPayloadIntercepted.rewrittenMessage;
       stored = rawPayloadIntercepted.stored;
@@ -4650,6 +4718,13 @@ export class LcmContextEngine implements ContextEngine {
       }
 
 
+      liveMessages = await this.largeFileInterceptor.externalizeRuntimeExternalFiles({
+        conversationId: conversation.conversationId,
+        messages: liveMessages,
+        runtimeContext: params.runtimeContext,
+        logWarn: (message) => this.deps.log.warn(message),
+      });
+
       // Intercept large tool results in live messages so even degraded
       // fallback paths send stubbed content to the model. The
       // afterTurn ingest path also runs `interceptLargeToolResults` on
@@ -4989,12 +5064,23 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const overflowExternalization = await this.largeFileInterceptor.externalizeInlinePayloadsForOverflow({
+        conversationId: conversation.conversationId,
+        messages: volatileLiveInputAppend.messages,
+        tokenBudget,
+      });
+      if (overflowExternalization.externalizedCount > 0) {
+        this.deps.log.warn(
+          `[lcm] assemble: externalized inline payload overflow conversation=${conversation.conversationId} ${sessionLabel} externalized=${overflowExternalization.externalizedCount} estimatedTokens=${overflowExternalization.estimatedTokens} tokenBudget=${tokenBudget}`,
+        );
+      }
+
       // Final budget clamp by serialized (model-boundary) estimate. Internal
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
       let serializedClamp = clampMessagesToSerializedBudget({
-        messages: volatileLiveInputAppend.messages,
+        messages: overflowExternalization.messages,
         tokenBudget,
         preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
@@ -5002,10 +5088,10 @@ export class LcmContextEngine implements ContextEngine {
         // The recall cue is optional enrichment: drop it before evicting any
         // real context, mirroring the internal cue-vs-eviction priority.
         const cueMessage = budgetedPromptRecallCue.message;
-        const withoutCue = volatileLiveInputAppend.messages.filter(
+        const withoutCue = overflowExternalization.messages.filter(
           (message) => message !== cueMessage,
         );
-        if (withoutCue.length < volatileLiveInputAppend.messages.length) {
+        if (withoutCue.length < overflowExternalization.messages.length) {
           serializedClamp = clampMessagesToSerializedBudget({
             messages: withoutCue,
             tokenBudget,

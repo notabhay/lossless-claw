@@ -83,6 +83,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       expansionProvider: "",
       expansionModel: "",
+      normalDelegationTimeoutMs: 30000,
       delegationTimeoutMs: 120000,
       timezone: "UTC",
       pruneHeartbeatOk: false,
@@ -188,11 +189,326 @@ describe("createLcmExpandQueryTool", () => {
     expect(properties.query?.description).toContain("Use 1-3 distinctive terms or a quoted phrase");
     expect(properties.prompt?.description).toContain("Put the answer request here, not in query");
     expect(properties.timeoutMs?.description).toContain("dynamic tool RPC timeout");
+    expect(properties.mode).toMatchObject({ default: "normal" });
     expect(properties.timeoutMs).toMatchObject({
-      default: 150000,
       minimum: 1,
     });
-    expect(schema.required).toContain("timeoutMs");
+    expect(properties.timeoutMs).not.toHaveProperty("default");
+    expect(schema.required).not.toContain("timeoutMs");
+  });
+
+  it("requires explicit forensic mode for cross-conversation expansion", async () => {
+    const retrieval = makeRetrieval();
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+
+    const result = await tool.execute("call-normal-cross-conversation", {
+      query: "rollback plan",
+      prompt: "What did we decide?",
+      allConversations: true,
+    });
+
+    expect(result.details).toMatchObject({
+      mode: "normal",
+      error: expect.stringContaining('mode: "forensic"'),
+    });
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect(callGatewayMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps an explicit normal conversation single-child when allConversations is also set", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") return { runId: "run-explicit-normal" };
+      if (request.method === "agent.wait") return { status: "ok" };
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: JSON.stringify({
+                answer: "The explicitly selected conversation is enough.",
+                citedIds: ["sum_a"],
+                expandedSummaryCount: 1,
+                totalSourceTokens: 10,
+                truncated: false,
+              }),
+            },
+          ],
+        };
+      }
+      return { ok: true };
+    });
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+
+    const result = await tool.execute("call-normal-explicit-scope", {
+      summaryIds: ["sum_a"],
+      prompt: "What happened?",
+      conversationId: 42,
+      allConversations: true,
+    });
+
+    expect(result.details).toMatchObject({
+      answer: "The explicitly selected conversation is enough.",
+      mode: "normal",
+      sourceConversationId: 42,
+    });
+    expect(
+      callGatewayMock.mock.calls.filter(
+        ([opts]) => (opts as { method?: string }).method === "agent",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("bounds normal discovery before any child can spawn", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockImplementation(() => new Promise(() => {}));
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+
+    const result = await Promise.race([
+      tool.execute("call-normal-discovery-timeout", {
+        query: "stalled lookup",
+        prompt: "What happened?",
+        conversationId: 42,
+        timeoutMs: 1,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("normal discovery did not respect its deadline")), 100),
+      ),
+    ]);
+
+    expect(result.details).toMatchObject({
+      mode: "normal",
+      errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+    });
+    expect(callGatewayMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the bounded normal-chat delegation contract by default", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") return { runId: "run-normal" };
+      if (request.method === "agent.wait") return { status: "ok" };
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: JSON.stringify({
+                answer: "The seed summary contains the answer.",
+                citedIds: ["sum_a"],
+                expandedSummaryCount: 1,
+                totalSourceTokens: 10,
+                truncated: false,
+              }),
+            },
+          ],
+        };
+      }
+      return { ok: true };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-normal-contract", {
+      summaryIds: ["sum_a"],
+      prompt: "What happened?",
+      conversationId: 42,
+      timeoutMs: 120000,
+    });
+
+    const agentCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .find((entry) => entry.method === "agent");
+    const message = String(agentCall?.params?.message ?? "");
+    expect(message).toContain("Inspect at most two seed summaries");
+    expect(message).toContain("do not call `lcm_grep`");
+    expect(message).toContain("at most two high-signal paths");
+    expect(message).toContain("truncated: true");
+    expect(message).not.toContain('Prefer `mode: "full_text"`');
+    expect(result.details).toMatchObject({ mode: "normal" });
+
+    const waitCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; timeoutMs?: number })
+      .find((entry) => entry.method === "agent.wait");
+    expect(Number(waitCall?.timeoutMs)).toBeLessThanOrEqual(30_000);
+  });
+
+  it("bounds a never-resolving normal delegated spawn and still completes cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+      let resolveSpawn!: (value: { runId: string }) => void;
+      const delayedSpawn = new Promise<{ runId: string }>((resolve) => {
+        resolveSpawn = resolve;
+      });
+      let delegatedSessionKey = "";
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string; params?: Record<string, unknown> };
+        if (request.method === "agent") {
+          delegatedSessionKey = String(request.params?.sessionKey ?? "");
+          return delayedSpawn;
+        }
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+
+      const resultPromise = tool.execute("call-normal-hanging-spawn", {
+        summaryIds: ["sum_a"],
+        prompt: "What happened?",
+        conversationId: 42,
+      });
+      await vi.advanceTimersByTimeAsync(35_000);
+      const result = await resultPromise;
+
+      expect(result.details).toMatchObject({
+        errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+        mode: "normal",
+        conversationBreakdown: [
+          expect.objectContaining({ phase: "spawn", elapsedMs: 30_000 }),
+        ],
+      });
+      expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
+      expect(
+        callGatewayMock.mock.calls.filter(
+          ([opts]) => (opts as { method?: string }).method === "sessions.delete",
+        ),
+      ).toHaveLength(1);
+
+      resolveSpawn({ runId: "run-late-spawn" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        callGatewayMock.mock.calls.filter(
+          ([opts]) => (opts as { method?: string }).method === "sessions.delete",
+        ),
+      ).toHaveLength(2);
+      expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a never-resolving normal delegated reply read and still completes cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-hanging-read" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return new Promise(() => {});
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+
+      const resultPromise = tool.execute("call-normal-hanging-read", {
+        summaryIds: ["sum_a"],
+        prompt: "What happened?",
+        conversationId: 42,
+      });
+      await vi.advanceTimersByTimeAsync(35_000);
+      const result = await resultPromise;
+
+      expect(result.details).toMatchObject({
+        errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+        mode: "normal",
+        conversationBreakdown: [
+          expect.objectContaining({ phase: "read_reply", elapsedMs: 30_000 }),
+        ],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a never-resolving normal delegated cleanup at the total deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-hanging-cleanup" };
+        if (request.method === "agent.wait") return { status: "timeout" };
+        if (request.method === "sessions.delete") return new Promise(() => {});
+        return {};
+      });
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+
+      const resultPromise = tool.execute("call-normal-hanging-cleanup", {
+        summaryIds: ["sum_a"],
+        prompt: "What happened?",
+        conversationId: 42,
+      });
+      await vi.advanceTimersByTimeAsync(35_000);
+      const result = await resultPromise;
+
+      expect(result.details).toMatchObject({
+        errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+        mode: "normal",
+        conversationBreakdown: [
+          expect.objectContaining({ phase: "wait", elapsedMs: 35_000 }),
+        ],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("returns a focused delegated answer for explicit summaryIds", async () => {
@@ -615,6 +931,7 @@ describe("createLcmExpandQueryTool", () => {
 
     expect(result.details).toMatchObject({
       error: "prompt is required.",
+      mode: "normal",
     });
     expect(callGatewayMock).not.toHaveBeenCalled();
   });
@@ -906,6 +1223,7 @@ describe("createLcmExpandQueryTool", () => {
       summaryIds: ["sum_a"],
       prompt: "Answer this",
       conversationId: 42,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -929,6 +1247,49 @@ describe("createLcmExpandQueryTool", () => {
     );
     expect(deps.log.warn).toHaveBeenCalledWith(
       expect.stringContaining("retrying delegated expansion without provider/model override"),
+    );
+  });
+
+  it("does not retry a normal recall after an expansion override failure", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+    callGatewayMock.mockRejectedValue(new Error("401 Missing scopes: model.request"));
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          expansionProvider: "openai-codex",
+          expansionModel: "gpt-5.4",
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+
+    const result = await tool.execute("call-normal-no-retry", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+
+    expect(result.details).toMatchObject({
+      mode: "normal",
+      errorCode: "DELEGATED_EXPANSION_SPAWN_FAILED",
+    });
+    expect(
+      callGatewayMock.mock.calls.filter(
+        ([entry]) => (entry as { method?: string }).method === "agent",
+      ),
+    ).toHaveLength(1);
+    expect(deps.log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("retrying delegated expansion"),
     );
   });
 
@@ -999,6 +1360,7 @@ describe("createLcmExpandQueryTool", () => {
       summaryIds: ["sum_a"],
       prompt: "Answer this",
       conversationId: 42,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -1089,6 +1451,7 @@ describe("createLcmExpandQueryTool", () => {
       summaryIds: ["sum_a"],
       prompt: "Answer this",
       conversationId: 42,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -1115,7 +1478,7 @@ describe("createLcmExpandQueryTool", () => {
     );
   });
 
-  it("returns timeout when delegated run exceeds 120 seconds", async () => {
+  it("retains the 120-second timeout for explicit forensic recall", async () => {
     const retrieval = makeRetrieval();
     retrieval.describe.mockResolvedValue({
       type: "summary",
@@ -1148,6 +1511,7 @@ describe("createLcmExpandQueryTool", () => {
       summaryIds: ["sum_a"],
       prompt: "Summarize root cause",
       conversationId: 42,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -1318,6 +1682,7 @@ describe("createLcmExpandQueryTool", () => {
       summaryIds: ["sum_a"],
       prompt: "Summarize root cause",
       conversationId: 42,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -1381,6 +1746,7 @@ describe("createLcmExpandQueryTool", () => {
 
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (30s).",
+      mode: "normal",
     });
     expect(waitCalls).toHaveLength(1);
     expect(waitCalls[0]?.paramsTimeoutMs).toBe(waitCalls[0]?.timeoutMs);
@@ -1423,12 +1789,15 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "Summarize root cause",
       conversationId: 42,
       timeoutMs: 20_000,
+      mode: "forensic",
     });
 
     expect(waitCalls).toEqual([]);
     expect(callGatewayMock).not.toHaveBeenCalled();
     expect(result.details).toMatchObject({
-      error: "lcm_expand_query timed out waiting for delegated expansion (1s).",
+      error: "lcm_expand_query timed out during discovery before delegated expansion.",
+      errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+      mode: "forensic",
     });
   });
 
@@ -1614,6 +1983,7 @@ describe("createLcmExpandQueryTool", () => {
     const result = await tool.execute("call-5", {
       query: "deploy regression",
       prompt: "What regressed?",
+      mode: "forensic",
     });
 
     expect(retrieval.grep).toHaveBeenCalledWith(
@@ -1734,6 +2104,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What did we decide across sessions?",
       allConversations: true,
       tokenCap: 2000,
+      mode: "forensic",
     });
 
     expect(retrieval.grep).toHaveBeenCalledWith(
@@ -1865,6 +2236,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What rollout steps were captured?",
       allConversations: true,
       tokenCap: 2000,
+      mode: "forensic",
     });
 
     expect(agentMessages).toHaveLength(2);
@@ -1977,6 +2349,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What happened across sessions?",
       allConversations: true,
       tokenCap: 2000,
+      mode: "forensic",
     });
 
     expect(agentMessages).toHaveLength(3);
@@ -2072,6 +2445,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What did we preserve?",
       allConversations: true,
       tokenCap: 2000,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -2149,6 +2523,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What happened?",
       allConversations: true,
       tokenCap: 2000,
+      mode: "forensic",
     });
 
     expect(result.details).toMatchObject({
@@ -2253,6 +2628,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What happened?",
       allConversations: true,
       tokenCap: 2000,
+      mode: "forensic",
     });
 
     await bothStarted;
@@ -2342,6 +2718,7 @@ describe("createLcmExpandQueryTool", () => {
       prompt: "What did we learn?",
       allConversations: true,
       tokenCap: 500,
+      mode: "forensic",
     });
 
     expect(agentMessages).toHaveLength(2);

@@ -35,6 +35,8 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
+    expect(config.rawUserPayloadMode).toBe("externalize-large");
+    expect(config.toolResultPayloadMode).toBe("externalize-large");
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.sweepMaxDepth).toBe(1);
     expect(config.incrementalMaxDepth).toBe(1);
@@ -88,6 +90,8 @@ describe("resolveLcmConfig", () => {
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
+      rawUserPayloadMode: "inline",
+      toolResultPayloadMode: "inline",
       leafChunkTokens: 80000,
       sweepMaxDepth: 2,
       newSessionRetainDepth: 3,
@@ -144,6 +148,8 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(16);
     expect(config.freshTailMaxTokens).toBe(12000);
     expect(config.promptAwareEviction).toBe(false);
+    expect(config.rawUserPayloadMode).toBe("inline");
+    expect(config.toolResultPayloadMode).toBe("inline");
     expect(config.newSessionRetainDepth).toBe(3);
     expect(config.leafChunkTokens).toBe(80000);
     expect(config.sweepMaxDepth).toBe(2);
@@ -199,6 +205,8 @@ describe("resolveLcmConfig", () => {
       LCM_FRESH_TAIL_COUNT: "64",
       LCM_FRESH_TAIL_MAX_TOKENS: "32000",
       LCM_PROMPT_AWARE_EVICTION_ENABLED: "false",
+      LCM_RAW_USER_PAYLOAD_MODE: "inline",
+      LCM_TOOL_RESULT_PAYLOAD_MODE: "inline",
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_ENABLED: "false",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
@@ -372,6 +380,8 @@ describe("resolveLcmConfig", () => {
       freshTailCount: "24",
       freshTailMaxTokens: "4800",
       promptAwareEviction: "false",
+      rawUserPayloadMode: "inline",
+      toolResultPayloadMode: "inline",
       leafChunkTokens: "64000",
       newSessionRetainDepth: "6",
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
@@ -382,6 +392,8 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(24);
     expect(config.freshTailMaxTokens).toBe(4800);
     expect(config.promptAwareEviction).toBe(false);
+    expect(config.rawUserPayloadMode).toBe("inline");
+    expect(config.toolResultPayloadMode).toBe("inline");
     expect(config.newSessionRetainDepth).toBe(6);
     expect(config.leafChunkTokens).toBe(64000);
     expect(config.ignoreSessionPatterns).toEqual([
@@ -470,6 +482,13 @@ describe("resolveLcmConfig", () => {
       delegationTimeoutMs: 300000,
     });
     expect(config.delegationTimeoutMs).toBe(300000);
+  });
+
+  it("reads normalDelegationTimeoutMs from plugin config and caps it at the normal budget", () => {
+    const config = resolveLcmConfig({}, {
+      normalDelegationTimeoutMs: 35000,
+    });
+    expect(config.normalDelegationTimeoutMs).toBe(30000);
   });
 
   it("reads cache-aware compaction settings from plugin config", () => {
@@ -569,6 +588,18 @@ describe("resolveLcmConfig", () => {
     expect(config.delegationTimeoutMs).toBe(180000);
   });
 
+  it("env var overrides normalDelegationTimeoutMs", () => {
+    const config = resolveLcmConfig(
+      {
+        LCM_NORMAL_DELEGATION_TIMEOUT_MS: "20000",
+      } as NodeJS.ProcessEnv,
+      {
+        normalDelegationTimeoutMs: 25000,
+      },
+    );
+    expect(config.normalDelegationTimeoutMs).toBe(20000);
+  });
+
   it("falls back to plugin delegationTimeoutMs when env value is invalid", () => {
     const config = resolveLcmConfig(
       {
@@ -658,12 +689,17 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.newSessionRetainDepth.minimum).toBe(-1);
   });
 
-  it("ships a manifest with expansionModel, expansionProvider, and delegationTimeoutMs in schema", () => {
+  it("ships a manifest with expansion model and delegation timeout settings in schema", () => {
     expect(manifest.configSchema.properties.expansionModel).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.expansionProvider).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.delegationTimeoutMs).toEqual({
       type: "integer",
       minimum: 1,
+    });
+    expect(manifest.configSchema.properties.normalDelegationTimeoutMs).toEqual({
+      type: "integer",
+      minimum: 1,
+      maximum: 30000,
     });
   });
 
@@ -907,6 +943,7 @@ describe("resolveLcmConfig", () => {
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.bootstrapMaxTokens).toBe(6000);
+    expect(config.normalDelegationTimeoutMs).toBe(30000);
     expect(config.delegationTimeoutMs).toBe(120000);
     expect(config.summaryMaxOverageFactor).toBe(3);
     expect(config.fallbackMaxTokens).toBe(512);

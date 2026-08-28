@@ -120,7 +120,7 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.2-beta.2` or newer. That beta is the first published build with the branch-safe visible transcript projection used to bootstrap SQLite-backed sessions; stable `2026.7.1` does not provide it. If you cannot use a beta or upgrade OpenClaw, stay on a `lossless-claw` release compatible with your installed OpenClaw version.
+> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.1` or newer. Hosts at `2026.7.2-beta.2` or newer export the branch-safe visible transcript projection natively. On `2026.7.1`, which keeps transcripts as append-only JSONL, the plugin rebuilds the same projection locally from the host's raw transcript events using the host's own transcript-tree semantics. That compatibility reader disregards only the host-injected `<state>/agents/<agent>/agent/openclaw-agent.sqlite` hint when no active JSONL file is present, because that old SDK otherwise mistakes the database for a sessions directory; explicit files and every other caller-owned store path remain unchanged. The startup log reports `transcript projection source=host-native` or `source=jsonl-compat`. The atomic `commitTurn` ledger is only exercised on hosts that call it; older hosts keep the `afterTurn` path.
 
 On OpenClaw hosts that advertise the durable context-engine turn contract,
 LosslessClaw declares current-turn transcript fencing and commits each accepted
@@ -249,6 +249,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
           "expansionModel": "openai/gpt-5.4-mini",
+          "normalDelegationTimeoutMs": 30000,
           "delegationTimeoutMs": 300000,
           "summaryTimeoutMs": 60000,
           "summaryCallWindowMs": 600000,
@@ -263,7 +264,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 
 The `ignoreSessionPatterns` entries in this example are storage exclusions. Matching cron, active-memory, and OpenClaw memory-core dreaming narrative sessions do not create LCM conversation rows or store messages in LCM.
 
-`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). `summaryMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs` bound repeated non-auth summarization spend per session. When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
+`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Every resolved summary candidate, including OpenClaw defaults and runtime/session hints, is sent explicitly and requires `llm.allowModelOverride` plus a matching `llm.allowedModels` entry for `lossless-claw`. Low summary reasoning is passed to the host for model-specific normalization. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). Default `mode: "normal"` uses `normalDelegationTimeoutMs`, capped at 30000ms of work with 5000ms of cleanup/RPC headroom. Explicit `mode: "forensic"` uses `delegationTimeoutMs`, which defaults to `120000` (120s) and keeps 30 seconds of headroom. OpenClaw 2026.7.1 cannot enforce a recall-only child-tool allowlist, so normal mode's retrieval limits are prompt restrictions. `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). `summaryMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs` bound repeated non-auth summarization spend per session. When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
 
@@ -293,7 +294,8 @@ The `ignoreSessionPatterns` entries in this example are storage exclusions. Matc
 | `LCM_SUMMARY_BASE_URL` | *(from OpenClaw / provider default)* | Base URL override for summarization API calls |
 | `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `openai/gpt-5.4-mini`) |
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
-| `LCM_DELEGATION_TIMEOUT_MS` | `120000` | Max time to wait for delegated `lcm_expand_query` sub-agent completion |
+| `LCM_NORMAL_DELEGATION_TIMEOUT_MS` | `30000` | Work budget for normal live-chat expansion, capped at 30000ms |
+| `LCM_DELEGATION_TIMEOUT_MS` | `120000` | Work budget for explicit forensic `lcm_expand_query` recall |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Max time to wait for a single model-backed LCM summarizer call |
 | `LCM_SUMMARY_CALL_WINDOW_MS` | `600000` | Rolling window used by the per-session summarization spend guard |
 | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | `24` | Max model-backed summarization calls per session/window before spend backoff opens |
@@ -338,7 +340,7 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
 - `subagent.allowedModels` is optional but recommended. Use `"*"` only if you intentionally want to trust any target model.
 - The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
 - If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
-- `openclaw doctor --fix` can add the required `subagent` policy for a configured `expansionModel`. If a host still rejects a stale or unavailable override, `lcm_expand_query` retries once without the override so recall does not fail hard.
+- `openclaw doctor --fix` can add the required `subagent` policy for a configured `expansionModel`. If a host still rejects a stale or unavailable override, forensic `lcm_expand_query` retries once without the override so recall does not fail hard. Normal recall returns the first failure so it never creates a second child.
 
 Plugin config equivalents:
 

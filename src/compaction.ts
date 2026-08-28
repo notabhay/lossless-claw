@@ -57,6 +57,19 @@ export interface CompactionResult {
   stoppedAtBudget?: boolean;
 }
 
+export interface CompactUntilUnderResult {
+  success: boolean;
+  /** True only when at least one sweep changed persisted context. */
+  actionTaken: boolean;
+  /** True when no eligible leaf or condensed material remains. */
+  notEligible?: boolean;
+  /** Number of attempted sweeps. */
+  rounds: number;
+  /** Projected live prompt tokens after compaction, including runtime overhead. */
+  finalTokens: number;
+  authFailure?: boolean;
+}
+
 export interface CompactionConfig {
   /** Context threshold as fraction of budget (default 0.75) */
   contextThreshold: number;
@@ -1365,7 +1378,7 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+  }): Promise<CompactUntilUnderResult> {
     return this.withContextCache(() => this._compactUntilUnderImpl(input));
   }
 
@@ -1381,7 +1394,7 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+  }): Promise<CompactUntilUnderResult> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
       typeof input.targetTokens === "number" &&
@@ -1397,13 +1410,18 @@ export class CompactionEngine {
       input.currentTokens > 0
         ? Math.floor(input.currentTokens)
         : 0;
-    let lastTokens = Math.max(storedTokens, liveTokens);
+    // Runtime framing, system prompt, and other host-owned tokens are not in
+    // context_items. Preserve that delta after every persisted-context sweep.
+    const liveOverheadTokens = Math.max(0, liveTokens - storedTokens);
+    let storedTokensAfter = storedTokens;
+    let lastTokens = storedTokensAfter + liveOverheadTokens;
+    let actionTaken = false;
 
     // For forced overflow recovery, callers may pass an observed count that
     // equals the context budget. Treat equality as still needing a compaction
     // attempt so we can create headroom for provider-side framing overhead.
     if (lastTokens < targetTokens) {
-      return { success: true, rounds: 0, finalTokens: lastTokens };
+      return { success: true, actionTaken: false, rounds: 0, finalTokens: lastTokens };
     }
 
     // Operation-wide wall-clock bound. Each round runs a compactFullSweep that
@@ -1428,6 +1446,7 @@ export class CompactionEngine {
         );
         return {
           success: lastTokens <= targetTokens,
+          actionTaken,
           rounds: round - 1,
           finalTokens: lastTokens,
         };
@@ -1452,36 +1471,55 @@ export class CompactionEngine {
       if (result.authFailure) {
         return {
           success: false,
+          actionTaken: actionTaken || result.actionTaken,
           rounds: round,
-          finalTokens: result.tokensAfter,
+          finalTokens: result.tokensAfter + liveOverheadTokens,
           authFailure: true,
         };
       }
 
-      if (result.tokensAfter <= targetTokens) {
-        return {
-          success: true,
-          rounds: round,
-          finalTokens: result.tokensAfter,
-        };
-      }
+      actionTaken ||= result.actionTaken;
+      const projectedTokensAfter = result.tokensAfter + liveOverheadTokens;
 
-      // No progress -- bail to avoid infinite loop
-      if (!result.actionTaken || result.tokensAfter >= lastTokens) {
+      if (!result.actionTaken) {
         return {
           success: false,
+          actionTaken,
+          ...(!result.stoppedAtBudget ? { notEligible: true } : {}),
           rounds: round,
-          finalTokens: result.tokensAfter,
+          finalTokens: projectedTokensAfter,
         };
       }
 
-      lastTokens = result.tokensAfter;
+      if (projectedTokensAfter <= targetTokens) {
+        return {
+          success: true,
+          actionTaken,
+          rounds: round,
+          finalTokens: projectedTokensAfter,
+        };
+      }
+
+      // Persisted context changed but did not shrink. Bail to avoid an
+      // infinite loop while still reporting the real mutation honestly.
+      if (result.tokensAfter >= storedTokensAfter) {
+        return {
+          success: false,
+          actionTaken,
+          rounds: round,
+          finalTokens: projectedTokensAfter,
+        };
+      }
+
+      storedTokensAfter = result.tokensAfter;
+      lastTokens = projectedTokensAfter;
     }
 
     // Exhausted all rounds — use the last known token count from compact() result
     const finalTokens = lastTokens;
     return {
       success: finalTokens <= targetTokens,
+      actionTaken,
       rounds: this.config.maxRounds,
       finalTokens,
     };

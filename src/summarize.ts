@@ -49,15 +49,19 @@ type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
   model: string;
 };
 
-/** Build the explicit runtime LLM model override attached to configured LCM models. */
+/**
+ * Preserve the selected candidate when crossing into the host-owned runtime.
+ *
+ * The host is the policy boundary and may reject this explicit model selection.
+ * Omitting the model would silently substitute the agent default, which makes a
+ * configured candidate or fallback only diagnostic fiction.
+ */
 function buildRuntimeModelOverride(
   candidate: ResolvedSummaryCandidate,
-): RuntimeLlmModelOverride | undefined {
-  const configField = candidate.runtimeModelOverrideField?.trim();
-  const configPath = candidate.runtimeModelOverrideConfigPath?.trim();
-  if (!configField || !configPath) {
-    return undefined;
-  }
+): RuntimeLlmModelOverride {
+  const configField = candidate.runtimeModelOverrideField?.trim() || candidate.levelName;
+  const configPath =
+    candidate.runtimeModelOverrideConfigPath?.trim() || `runtime selection: ${candidate.levelName}`;
   return {
     configField,
     configPath,
@@ -1414,20 +1418,24 @@ function resolveSummaryCandidates(params: {
       modelRef: readModelRef(runtimeConfig?.agents?.defaults?.compaction?.model),
       providerHint: undefined,
       hasExplicitProvider: false,
+      runtimeModelOverrideField: "agents.defaults.compaction.model",
+      runtimeModelOverrideConfigPath: "agents.defaults.compaction.model",
     },
     {
       levelName: "OpenClaw agents.defaults.model",
       modelRef: readModelRef(runtimeConfig?.agents?.defaults?.model),
       providerHint: undefined,
       hasExplicitProvider: false,
+      runtimeModelOverrideField: "agents.defaults.model",
+      runtimeModelOverrideConfigPath: "agents.defaults.model",
     },
     {
       levelName: "legacy runtime/session model",
       modelRef: modelHint,
       providerHint: providerHint || undefined,
       hasExplicitProvider: Boolean(providerHint),
-      runtimeModelOverrideField: legacyModelConfigField,
-      runtimeModelOverrideConfigPath: legacyModelConfigPath,
+      runtimeModelOverrideField: legacyModelConfigField ?? "runtime session model",
+      runtimeModelOverrideConfigPath: legacyModelConfigPath ?? "runtime session model",
     },
   ];
 
@@ -1478,6 +1486,8 @@ function resolveSummaryCandidates(params: {
           modelRef: "",
           providerHint: providerHint || undefined,
           hasExplicitProvider: false,
+          runtimeModelOverrideField: "effective runtime model",
+          runtimeModelOverrideConfigPath: "runtime default selection",
           provider: resolved.provider,
           model: resolved.model,
         });

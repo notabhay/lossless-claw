@@ -57,6 +57,7 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 function makeDeps() {
   const logInfo = vi.fn();
   const logWarn = vi.fn();
+  const logDebug = vi.fn();
   const deps: Pick<
     LcmDependencies,
     | "callGateway"
@@ -78,10 +79,10 @@ function makeDeps() {
       info: logInfo,
       warn: logWarn,
       error: vi.fn(),
-      debug: vi.fn(),
+      debug: logDebug,
     },
   };
-  return { deps, logInfo, logWarn };
+  return { deps, logInfo, logWarn, logDebug };
 }
 
 describe("runDelegatedExpansionLoop recursion guard", () => {
@@ -114,7 +115,7 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
   });
 
   it("runs delegated expansion when not in delegated context", async () => {
-    const { deps } = makeDeps();
+    const { deps, logDebug } = makeDeps();
     let lastAgentMessage = "";
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: Record<string, unknown> };
@@ -171,10 +172,11 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
       timeout: 0,
       success: 1,
     });
+    expect(logDebug.mock.calls.map(([line]) => String(line)).join("\n")).toContain('"mode":"legacy"');
   });
 
   it("blocks delegated expansion helper re-entry at depth cap", async () => {
-    const { deps } = makeDeps();
+    const { deps, logWarn } = makeDeps();
     stampDelegatedExpansionContext({
       sessionKey: "agent:main:subagent:blocked",
       requestId: "req-loop",
@@ -205,5 +207,6 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
       timeout: 0,
       success: 0,
     });
+    expect(logWarn.mock.calls.map(([line]) => String(line)).join("\n")).toContain('"mode":"legacy"');
   });
 });

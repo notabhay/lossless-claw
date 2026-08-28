@@ -537,6 +537,31 @@ describe("LCM integration: compaction", () => {
     expect(new Set(fetchedIds)).toEqual(new Set(messages.map((message) => message.messageId)));
   });
 
+  it("fresh tail token caps make older protected messages eligible for compaction", async () => {
+    const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 69,
+      freshTailMaxTokens: 150,
+      leafChunkTokens: 200,
+    });
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Turn ${i}: ${"r".repeat(396)}`,
+      tokenCountFn: () => 100,
+    });
+
+    const summarize = vi.fn(async () => "token-bounded tail summary");
+    const result = await tokenAwareEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(summarize).toHaveBeenCalled();
+    expect(sumStore._summaries.some((summary) => summary.kind === "leaf")).toBe(true);
+  });
+
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {
     const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
@@ -2308,6 +2333,62 @@ describe("LCM integration: compaction", () => {
 
     expect(result.rounds).toBeGreaterThanOrEqual(1);
     expect(summarize).toHaveBeenCalled();
+  });
+
+  it("compactUntilUnder reports not eligible when a forced sweep cannot change protected context", async () => {
+    const protectedTailEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 69,
+    });
+    await ingestMessages(convStore, sumStore, 20, {
+      contentFn: (i) => `Protected turn ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const summarize = vi.fn(async () => "unused");
+    const result = await protectedTailEngine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 2_300,
+      targetTokens: 2_300,
+      currentTokens: 3_000,
+      summarize,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      actionTaken: false,
+      notEligible: true,
+      rounds: 1,
+      finalTokens: 3_000,
+    });
+    expect(summarize).not.toHaveBeenCalled();
+  });
+
+  it("compactUntilUnder preserves live overhead after stored context shrinks", async () => {
+    const liveOverheadEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 1,
+      leafChunkTokens: 1_000,
+    });
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => `Stored turn ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const summarize = vi.fn(async () => "x");
+    const result = await liveOverheadEngine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 600,
+      targetTokens: 600,
+      currentTokens: 800,
+      summarize,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.actionTaken).toBe(true);
+    expect(result.notEligible).toBe(true);
+    expect(result.finalTokens).toBeGreaterThan(600);
+    expect(summarize).toHaveBeenCalledTimes(1);
   });
 
   it("compactUntilUnder performs a forced round when currentTokens equals target", async () => {

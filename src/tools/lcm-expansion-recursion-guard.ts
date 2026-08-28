@@ -25,6 +25,7 @@ export type DelegatedExpansionContext = {
 
 export type ExpansionRecursionBlockReason = "depth_cap" | "idempotent_reentry";
 export type ExpansionConcurrencyBlockReason = "origin_session_in_flight";
+export type ExpansionTelemetryMode = "normal" | "forensic" | "legacy";
 
 export type ExpansionRecursionGuardDecision =
   | {
@@ -310,6 +311,7 @@ export function recordExpansionDelegationTelemetry(params: {
   sessionKey?: string;
   expansionDepth: number;
   originSessionKey: string;
+  mode: ExpansionTelemetryMode;
   reason?: string;
   runId?: string;
 }): void {
@@ -321,6 +323,7 @@ export function recordExpansionDelegationTelemetry(params: {
     sessionKey: normalizeSessionKey(params.sessionKey) || undefined,
     expansionDepth: params.expansionDepth,
     originSessionKey: params.originSessionKey,
+    mode: params.mode,
     reason: params.reason,
     runId: params.runId,
     counters: {
